@@ -13,6 +13,11 @@ pub struct Config {
     pub cleanup_retries: u32,
     /// Most helpers one subagent may spawn. The main session has no cap.
     pub max_helpers: u32,
+    /// Work tool calls (read, search, edit, shell) the main session may make per
+    /// user message in coordinator mode before it must delegate. 0 = no limit.
+    pub main_tool_budget: u32,
+    /// Largest edit (in lines) the main session may make itself in coordinator mode.
+    pub trivial_edit_lines: u32,
     /// Tools whose output is scanned for prompt injection (regex on tool name).
     pub scan_tools: String,
     /// Extra regexes for secrets that must never leave the machine.
@@ -28,6 +33,8 @@ impl Default for Config {
             loop_streak: 4,
             cleanup_retries: 2,
             max_helpers: 3,
+            main_tool_budget: 3,
+            trivial_edit_lines: 10,
             scan_tools: r"^(WebFetch|WebSearch|mcp__.*)$".into(),
             extra_secret_patterns: vec![],
             extra_injection_patterns: vec![],

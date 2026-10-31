@@ -24,7 +24,8 @@ pub fn run() -> Result<()> {
         "PreToolUse" => pre_tool(&cfg, &ev, &session, &agent),
         "PostToolUse" => post_tool(&cfg, &ev, &session),
         "SubagentStop" if agent != "main" => subagent_stop(&cfg, &ev, &session, &agent),
-        "UserPromptSubmit" => user_prompt(&session),
+        "UserPromptSubmit" => user_prompt(&cfg, &ev, &session),
+        "Stop" => main_stop(&session),
         "SessionEnd" => session_end(&session),
         _ => None,
     };
@@ -78,6 +79,12 @@ fn pre_tool(cfg: &config::Config, ev: &Value, session: &str, agent: &str) -> Opt
         state::log(session, &format!("deny [{agent}]: {r}"));
         decision("deny", r)
     };
+    if agent == "main"
+        && cfg.coordinator
+        && let Some(r) = coordinator_check(cfg, ev, session)
+    {
+        return deny(r);
+    }
     match ev["tool_name"].as_str().unwrap_or_default() {
         // The main session may background agents; it has a user to stay responsive for.
         "Agent" | "Task" if agent != "main" => {
@@ -221,22 +228,54 @@ fn post_tool(cfg: &config::Config, ev: &Value, session: &str) -> Option<Value> {
     }))
 }
 
+/// IDs of the subagents `agent` spawned. Claude Code writes an
+/// `agent-<id>.meta.json` next to each subagent transcript, and nested spawns
+/// record `parentAgentId`. Agents spawned by the main session have none, so
+/// they are never anyone's helpers.
+fn children_of(transcript: &str, agent: &str) -> Vec<String> {
+    let Some(dir) = std::path::Path::new(transcript).parent() else {
+        return vec![];
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return vec![];
+    };
+    entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let id = name
+                .strip_prefix("agent-")?
+                .strip_suffix(".meta.json")?
+                .to_owned();
+            let meta: Value =
+                serde_json::from_str(&std::fs::read_to_string(e.path()).ok()?).ok()?;
+            (meta["parentAgentId"] == agent).then_some(id)
+        })
+        .collect()
+}
+
 /// Work `agent` started that is still running when it stops, from the
-/// `background_tasks` list in the SubagentStop payload: its helper subagents
-/// (the list includes the stopping agent itself, which is skipped) and its
-/// background shells. Shells of other agents can appear in the list too, so a
-/// shell only counts if its command is one this agent ran.
-fn running_tasks(ev: &Value, agent: &str, own_commands: &[String]) -> (Vec<String>, Vec<String>) {
+/// `background_tasks` list in the SubagentStop payload. That list covers the
+/// whole session (siblings and other agents' shells included), so a subagent
+/// only counts if it is one of `children`, and a shell only if its command is
+/// one this agent ran.
+fn running_tasks(
+    ev: &Value,
+    children: &[String],
+    own_commands: &[String],
+) -> (Vec<String>, Vec<String>) {
     let mut helpers = vec![];
     let mut shells = vec![];
     for t in ev["background_tasks"].as_array().into_iter().flatten() {
-        if t["status"] != "running" || t["id"] == agent {
+        if t["status"] != "running" {
             continue;
         }
         let id = t["id"].as_str().unwrap_or("?");
         let desc = t["description"].as_str().unwrap_or("");
         match t["type"].as_str() {
-            Some("subagent") => helpers.push(format!("{id} ({desc})")),
+            Some("subagent") if children.iter().any(|c| c == id) => {
+                helpers.push(format!("{id} ({desc})"))
+            }
             Some("shell") => {
                 let cmd = t["command"].as_str().unwrap_or_default();
                 if own_commands.iter().any(|c| c == cmd) {
@@ -251,7 +290,11 @@ fn running_tasks(ev: &Value, agent: &str, own_commands: &[String]) -> (Vec<Strin
 
 fn subagent_stop(cfg: &config::Config, ev: &Value, session: &str, agent: &str) -> Option<Value> {
     let commands = state::commands_of(session, agent);
-    let (helpers, shells) = running_tasks(ev, agent, &commands);
+    let children = children_of(
+        ev["agent_transcript_path"].as_str().unwrap_or_default(),
+        agent,
+    );
+    let (helpers, shells) = running_tasks(ev, &children, &commands);
     let left = procs::agent_leftovers(session, &commands);
     if helpers.is_empty() && shells.is_empty() && left.is_empty() {
         return None;
@@ -321,17 +364,132 @@ fn subagent_stop(cfg: &config::Config, ev: &Value, session: &str, agent: &str) -
 }
 
 /// Deliver queued notices (orphaned helpers etc.) to the coordinator.
-fn user_prompt(session: &str) -> Option<Value> {
+/// Tools that do work, as opposed to coordinating it (Agent, SendMessage, task lists...).
+const WORK_TOOLS: &[&str] = &[
+    "Bash",
+    "Read",
+    "Grep",
+    "Glob",
+    "Edit",
+    "Write",
+    "MultiEdit",
+    "NotebookEdit",
+    "WebFetch",
+    "WebSearch",
+];
+
+const DELEGATE_HINT: &str = "Hand it to a background subagent (brood:implementer for edits, builds and tests; brood:researcher for lookups) and tell the user it's queued. If the user wants you to do it inline, they can add #solo to their message.";
+
+/// Keep the main session coordinating: no blocking builds or tests, and only a
+/// few work tool calls per user message.
+fn coordinator_check(cfg: &config::Config, ev: &Value, session: &str) -> Option<String> {
+    let tool = ev["tool_name"].as_str().unwrap_or_default();
+    if !WORK_TOOLS.contains(&tool) {
+        return None;
+    }
+    let mut st = state::load_agent(session, "main");
+    if st.solo {
+        return None;
+    }
+    let input = &ev["tool_input"];
+    if tool == "Bash"
+        && input["run_in_background"].as_bool() != Some(true)
+        && guard::is_build_or_test(input["command"].as_str().unwrap_or_default())
+    {
+        return Some(format!(
+            "coordinator mode: builds, tests and replays block the main session. {DELEGATE_HINT}"
+        ));
+    }
+    if let Some(lines) = edit_lines(tool, input) {
+        let path = input["file_path"]
+            .as_str()
+            .or(input["notebook_path"].as_str())
+            .unwrap_or_default()
+            .to_owned();
+        if cfg.trivial_edit_lines > 0 && lines > cfg.trivial_edit_lines as usize {
+            return Some(format!(
+                "coordinator mode: this edit changes {lines} lines, more than a trivial edit ({} max). {DELEGATE_HINT}",
+                cfg.trivial_edit_lines
+            ));
+        }
+        if !st.turn_files.is_empty() && !st.turn_files.contains(&path) {
+            return Some(format!(
+                "coordinator mode: trivial work touches one file, and this request already edited {}. {DELEGATE_HINT}",
+                st.turn_files[0]
+            ));
+        }
+        if !st.turn_files.contains(&path) {
+            st.turn_files.push(path);
+        }
+    }
+    st.turn_calls += 1;
+    state::save_agent(session, "main", &st);
+    if cfg.main_tool_budget > 0 && st.turn_calls > cfg.main_tool_budget {
+        return Some(format!(
+            "coordinator mode: this request has already used {} work tool calls in the main session, so it isn't trivial. {DELEGATE_HINT}",
+            st.turn_calls - 1
+        ));
+    }
+    None
+}
+
+/// Lines an edit tool call changes: the larger side of a replacement, or the
+/// whole content for a new file. `None` for tools that don't edit.
+fn edit_lines(tool: &str, input: &Value) -> Option<usize> {
+    let lines = |v: &Value| v.as_str().map_or(0, |s| s.lines().count().max(1));
+    match tool {
+        "Edit" => Some(lines(&input["old_string"]).max(lines(&input["new_string"]))),
+        "MultiEdit" => Some(
+            input["edits"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|e| lines(&e["old_string"]).max(lines(&e["new_string"])))
+                .sum(),
+        ),
+        "Write" => Some(lines(&input["content"])),
+        "NotebookEdit" => Some(lines(&input["new_source"])),
+        _ => None,
+    }
+}
+
+const TURN_REMINDER: &str = "brood coordinator mode: you coordinate, subagents do the work. Do it yourself only if it's trivial: an answer from what you already know, a quick lookup, or one small edit to one file (a few sentences in a doc, a typo, a config value; about 10 lines or fewer) that needs no build or test to trust. Delegate everything else to background subagents and stay free for the next request.";
+
+fn user_prompt(cfg: &config::Config, ev: &Value, session: &str) -> Option<Value> {
+    let mut st = state::load_agent(session, "main");
+    st.turn_calls = 0;
+    st.turn_files.clear();
+    st.solo = ev["prompt"].as_str().is_some_and(|p| p.contains("#solo"));
+    state::save_agent(session, "main", &st);
+
+    let mut parts = vec![];
+    if cfg.coordinator && !st.solo {
+        parts.push(TURN_REMINDER.to_owned());
+    }
     let notices = state::take_notices(session);
-    if notices.is_empty() {
+    if !notices.is_empty() {
+        parts.push(format!("brood notices:\n- {}", notices.join("\n- ")));
+    }
+    if parts.is_empty() {
         return None;
     }
     Some(json!({
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
-            "additionalContext": format!("brood notices:\n- {}", notices.join("\n- ")),
+            "additionalContext": parts.join("\n\n"),
         }
     }))
+}
+
+/// End of a main-session turn. Background-agent results can start new turns
+/// without a user message, so the per-message budget resets here too.
+fn main_stop(session: &str) -> Option<Value> {
+    let mut st = state::load_agent(session, "main");
+    st.turn_calls = 0;
+    st.turn_files.clear();
+    st.solo = false;
+    state::save_agent(session, "main", &st);
+    None
 }
 
 fn session_end(session: &str) -> Option<Value> {
@@ -362,18 +520,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn edit_sizes() {
+        let edit = json!({"old_string": "a typo", "new_string": "a fix\nand a second sentence"});
+        assert_eq!(edit_lines("Edit", &edit), Some(2));
+        let multi = json!({"edits": [{"old_string": "a", "new_string": "b"}, {"old_string": "c\nd\ne", "new_string": "f"}]});
+        assert_eq!(edit_lines("MultiEdit", &multi), Some(4));
+        assert_eq!(
+            edit_lines("Write", &json!({"content": "1\n2\n3\n"})),
+            Some(3)
+        );
+        assert_eq!(edit_lines("Read", &json!({})), None);
+    }
+
+    #[test]
     fn running_tasks_attributes_by_owner() {
         // Shape taken from real SubagentStop payloads.
         let ev = json!({"background_tasks": [
             {"id": "lead1", "type": "subagent", "status": "running", "description": "lead"},
             {"id": "help1", "type": "subagent", "status": "running", "description": "docs"},
             {"id": "help2", "type": "subagent", "status": "completed", "description": "art"},
+            {"id": "sib1", "type": "subagent", "status": "running", "description": "sibling"},
             {"id": "sh1", "type": "shell", "status": "running", "description": "mine", "command": "sleep 602"},
             {"id": "sh2", "type": "shell", "status": "running", "description": "not mine", "command": "npm run dev"}
         ]});
-        let (helpers, shells) = running_tasks(&ev, "lead1", &["sleep 602".into()]);
+        // help1 is lead1's child; sib1 is a sibling spawned by main.
+        let (helpers, shells) = running_tasks(
+            &ev,
+            &["help1".into(), "help2".into()],
+            &["sleep 602".into()],
+        );
         assert_eq!(helpers, vec!["help1 (docs)"]);
         assert_eq!(shells, vec!["sh1: sleep 602"]);
-        assert_eq!(running_tasks(&json!({}), "lead1", &[]), (vec![], vec![]));
+        assert_eq!(running_tasks(&json!({}), &[], &[]), (vec![], vec![]));
+    }
+
+    #[test]
+    fn children_from_meta_files() {
+        let dir = std::env::temp_dir().join(format!("brood-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |id: &str, meta: Value| {
+            std::fs::write(dir.join(format!("agent-{id}.meta.json")), meta.to_string()).unwrap()
+        };
+        write("lead1", json!({"agentType": "general-purpose"}));
+        write("sib1", json!({"agentType": "general-purpose"}));
+        write(
+            "adoc-art-781f",
+            json!({"name": "doc-art", "parentAgentId": "lead1", "taskKind": "in_process_teammate"}),
+        );
+        let transcript = dir.join("agent-lead1.jsonl");
+        assert_eq!(
+            children_of(transcript.to_str().unwrap(), "lead1"),
+            vec!["adoc-art-781f"]
+        );
+        assert!(children_of(transcript.to_str().unwrap(), "sib1").is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

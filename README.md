@@ -2,7 +2,7 @@
 
 A Claude Code plugin for long sessions with many subagents. It keeps the main session light and stops subagents from leaving a mess behind.
 
-- **Coordinator mode.** The main session plans and queues; work goes to subagents, background ones when independent, so you can keep adding tasks.
+- **Coordinator mode.** The main session plans and queues; work goes to background subagents, so you can keep adding tasks. The main session may still do trivial work itself (a few sentences in a doc, a typo, a config value), and brood holds it to that: per message, at most 3 work tool calls (read, search, edit, shell), one file edited, about 10 changed lines, and no foreground builds, tests or replays. Past that, the call is refused with "delegate this". Put `#solo` in a message to let the main session work inline for that message.
 - **Cheaper subagents.** `brood:researcher` (Haiku, read-only), `brood:implementer` (Sonnet), `brood:reviewer` (Opus). Every report starts with `STATUS: complete | partial | blocked`.
 - **No orphaned helpers.** Subagents must spawn their own helpers in the foreground (at most 3), so a lead can't hand back while its helpers are still writing. If one gets through anyway, brood sends the lead back, then tells the coordinator to resume it.
 - **No leftover processes.** `nohup`, `setsid`, `disown`, trailing `&` and `start /b` are refused in favour of the Bash tool's tracked `run_in_background`. A subagent that tries to finish with processes or background tasks still running is sent back to stop them, and brood kills what's left after two tries. Session end kills the session's leftovers, and each new session sweeps processes from crashed ones.
@@ -36,6 +36,8 @@ coordinator = true          # inject coordinator mode; or set BROOD_COORDINATOR=
 loop_streak = 4             # identical commands in a row before refusing (0 = off)
 cleanup_retries = 2         # times a subagent is sent back before brood cleans up itself
 max_helpers = 3             # helpers per subagent (0 = no cap)
+main_tool_budget = 3        # work tool calls per message in the main session (0 = no limit)
+trivial_edit_lines = 10     # largest edit the main session may make itself (0 = no limit)
 scan_tools = "^(WebFetch|WebSearch|mcp__.*)$"
 extra_secret_patterns = ["mykey_[A-Za-z0-9]{32}"]
 extra_injection_patterns = []

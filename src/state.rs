@@ -38,11 +38,18 @@ fn agent_file(session: &str, agent: &str) -> PathBuf {
 
 /// What brood remembers about one agent (or `main`) within a session.
 #[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AgentState {
     pub last_command: String,
     pub streak: u32,
     pub cleanup_blocks: u32,
     pub helpers_spawned: u32,
+    /// Main session only: work tool calls since the user's last message.
+    pub turn_calls: u32,
+    /// Main session only: the user said `#solo`, so this turn may work inline.
+    pub solo: bool,
+    /// Main session only: files edited since the user's last message.
+    pub turn_files: Vec<String>,
 }
 
 pub fn load_agent(session: &str, agent: &str) -> AgentState {

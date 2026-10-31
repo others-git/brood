@@ -60,6 +60,17 @@ pub fn is_network(cmd: &str) -> bool {
     NETWORK.is_match(cmd)
 }
 
+static BUILD: LazyLock<Regex> = LazyLock::new(|| {
+    re(
+        r"\b(cargo\s+(build|test|run|check|clippy|nextest|bench)|dotnet\s+(build|test|run|publish)|msbuild|(npm|pnpm|yarn|bun)\s+(run\s+\S+|test|build|install|ci)|npx\s+(jest|vitest|tsc|playwright)|pytest|tox|go\s+(build|test|run)|make|cmake|ninja|gradlew?|mvn|godot\S*|unity|xcodebuild|tsc)\b|replay",
+    )
+});
+
+/// Builds, test runs, replays and other commands that take a while.
+pub fn is_build_or_test(cmd: &str) -> bool {
+    BUILD.is_match(cmd)
+}
+
 const SECRET_PATTERNS: &[&str] = &[
     r"sk-ant-[A-Za-z0-9_\-]{20,}",
     r"\bsk-[A-Za-z0-9]{32,}",
@@ -157,6 +168,29 @@ mod tests {
         assert!(detached("cmd &> out.log").is_none());
         assert!(detached(r#"curl "https://x.test/?a=1&b=2""#).is_none());
         assert!(detached("echo 'nohup is a word'").is_none());
+    }
+
+    #[test]
+    fn builds_and_tests() {
+        for c in [
+            "cargo test",
+            "dotnet build game.csproj",
+            "npm run dev",
+            "tools/run_replays.sh",
+            "godot --headless -s x",
+            "make -j8",
+            "pytest -q",
+        ] {
+            assert!(is_build_or_test(c), "{c}");
+        }
+        for c in [
+            "git status",
+            "ls src",
+            "cat Makefile.md",
+            "grep -rn build src",
+        ] {
+            assert!(!is_build_or_test(c), "{c}");
+        }
     }
 
     #[test]
