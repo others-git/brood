@@ -6,6 +6,9 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use std::io::Read;
 
+/// brood's label for the main session (Claude Code gives it no agent id).
+pub const COORDINATOR: &str = "brood:coordinator";
+
 const COORDINATOR_FALLBACK: &str = include_str!("../plugin/context/coordinator.md");
 
 pub fn run() -> Result<()> {
@@ -17,13 +20,13 @@ pub fn run() -> Result<()> {
     }
     let cfg = config::load();
     let session = ev["session_id"].as_str().unwrap_or_default().to_owned();
-    let agent = ev["agent_id"].as_str().unwrap_or("main").to_owned();
+    let agent = ev["agent_id"].as_str().unwrap_or(COORDINATOR).to_owned();
 
     let out = match ev["hook_event_name"].as_str().unwrap_or_default() {
         "SessionStart" => session_start(&cfg, &session),
         "PreToolUse" => pre_tool(&cfg, &ev, &session, &agent),
         "PostToolUse" => post_tool(&cfg, &ev, &session),
-        "SubagentStop" if agent != "main" => subagent_stop(&cfg, &ev, &session, &agent),
+        "SubagentStop" if agent != COORDINATOR => subagent_stop(&cfg, &ev, &session, &agent),
         "UserPromptSubmit" => user_prompt(&cfg, &ev, &session),
         "Stop" => main_stop(&session),
         "SessionEnd" => session_end(&session),
@@ -79,7 +82,7 @@ fn pre_tool(cfg: &config::Config, ev: &Value, session: &str, agent: &str) -> Opt
         state::log(session, &format!("deny [{agent}]: {r}"));
         decision("deny", r)
     };
-    if agent == "main"
+    if agent == COORDINATOR
         && cfg.coordinator
         && let Some(r) = coordinator_check(cfg, ev, session)
     {
@@ -87,7 +90,7 @@ fn pre_tool(cfg: &config::Config, ev: &Value, session: &str, agent: &str) -> Opt
     }
     match ev["tool_name"].as_str().unwrap_or_default() {
         // The main session may background agents; it has a user to stay responsive for.
-        "Agent" | "Task" if agent != "main" => {
+        "Agent" | "Task" if agent != COORDINATOR => {
             if input["run_in_background"].as_bool() == Some(true) {
                 return deny("subagents must spawn helpers in the foreground, so you get their results before you hand back. Put several Agent calls in one message to run them in parallel.".into());
             }
@@ -387,7 +390,7 @@ fn coordinator_check(cfg: &config::Config, ev: &Value, session: &str) -> Option<
     if !WORK_TOOLS.contains(&tool) {
         return None;
     }
-    let mut st = state::load_agent(session, "main");
+    let mut st = state::load_agent(session, COORDINATOR);
     if st.solo {
         return None;
     }
@@ -397,7 +400,7 @@ fn coordinator_check(cfg: &config::Config, ev: &Value, session: &str) -> Option<
         && guard::is_build_or_test(input["command"].as_str().unwrap_or_default())
     {
         return Some(format!(
-            "coordinator mode: builds, tests and replays block the main session. {DELEGATE_HINT}"
+            "brood:coordinator: builds, tests and replays block the main session. {DELEGATE_HINT}"
         ));
     }
     if let Some(lines) = edit_lines(tool, input) {
@@ -408,13 +411,13 @@ fn coordinator_check(cfg: &config::Config, ev: &Value, session: &str) -> Option<
             .to_owned();
         if cfg.trivial_edit_lines > 0 && lines > cfg.trivial_edit_lines as usize {
             return Some(format!(
-                "coordinator mode: this edit changes {lines} lines, more than a trivial edit ({} max). {DELEGATE_HINT}",
+                "brood:coordinator: this edit changes {lines} lines, more than a trivial edit ({} max). {DELEGATE_HINT}",
                 cfg.trivial_edit_lines
             ));
         }
         if !st.turn_files.is_empty() && !st.turn_files.contains(&path) {
             return Some(format!(
-                "coordinator mode: trivial work touches one file, and this request already edited {}. {DELEGATE_HINT}",
+                "brood:coordinator: trivial work touches one file, and this request already edited {}. {DELEGATE_HINT}",
                 st.turn_files[0]
             ));
         }
@@ -423,10 +426,10 @@ fn coordinator_check(cfg: &config::Config, ev: &Value, session: &str) -> Option<
         }
     }
     st.turn_calls += 1;
-    state::save_agent(session, "main", &st);
+    state::save_agent(session, COORDINATOR, &st);
     if cfg.main_tool_budget > 0 && st.turn_calls > cfg.main_tool_budget {
         return Some(format!(
-            "coordinator mode: this request has already used {} work tool calls in the main session, so it isn't trivial. {DELEGATE_HINT}",
+            "brood:coordinator: this request has already used {} work tool calls in the main session, so it isn't trivial. {DELEGATE_HINT}",
             st.turn_calls - 1
         ));
     }
@@ -453,14 +456,14 @@ fn edit_lines(tool: &str, input: &Value) -> Option<usize> {
     }
 }
 
-const TURN_REMINDER: &str = "brood coordinator mode: you coordinate, subagents do the work. Do it yourself only if it's trivial: an answer from what you already know, a quick lookup, or one small edit to one file (a few sentences in a doc, a typo, a config value; about 10 lines or fewer) that needs no build or test to trust. Delegate everything else to background subagents and stay free for the next request.";
+const TURN_REMINDER: &str = "You are brood:coordinator: you coordinate, subagents do the work. Do it yourself only if it's trivial: an answer from what you already know, a quick lookup, or one small edit to one file (a few sentences in a doc, a typo, a config value; about 10 lines or fewer) that needs no build or test to trust. Delegate everything else to background subagents and stay free for the next request.";
 
 fn user_prompt(cfg: &config::Config, ev: &Value, session: &str) -> Option<Value> {
-    let mut st = state::load_agent(session, "main");
+    let mut st = state::load_agent(session, COORDINATOR);
     st.turn_calls = 0;
     st.turn_files.clear();
     st.solo = ev["prompt"].as_str().is_some_and(|p| p.contains("#solo"));
-    state::save_agent(session, "main", &st);
+    state::save_agent(session, COORDINATOR, &st);
 
     let mut parts = vec![];
     if cfg.coordinator && !st.solo {
@@ -484,11 +487,11 @@ fn user_prompt(cfg: &config::Config, ev: &Value, session: &str) -> Option<Value>
 /// End of a main-session turn. Background-agent results can start new turns
 /// without a user message, so the per-message budget resets here too.
 fn main_stop(session: &str) -> Option<Value> {
-    let mut st = state::load_agent(session, "main");
+    let mut st = state::load_agent(session, COORDINATOR);
     st.turn_calls = 0;
     st.turn_files.clear();
     st.solo = false;
-    state::save_agent(session, "main", &st);
+    state::save_agent(session, COORDINATOR, &st);
     None
 }
 
