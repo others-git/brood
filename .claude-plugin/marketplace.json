@@ -1,0 +1,7 @@
+{
+  "name": "brood",
+  "owner": { "name": "others-git" },
+  "plugins": [
+    { "name": "brood", "source": "./plugin", "description": "Coordinator mode, subagent cleanup, and guards for Claude Code." }
+  ]
+}
