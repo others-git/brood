@@ -13,14 +13,17 @@ fn re(p: &str) -> Regex {
         .expect("valid builtin regex")
 }
 
-/// Remove quoted strings so `&` or paths inside quotes don't count.
+/// Neutralise quoted strings: inside quotes, whitespace and shell symbols
+/// become `_`, so a quoted `&` or `;` doesn't count as shell syntax, a quoted
+/// sentence stays one word, and a quoted program path stays usable.
 fn strip_quotes(cmd: &str) -> String {
     let mut out = String::with_capacity(cmd.len());
     let mut quote: Option<char> = None;
     for c in cmd.chars() {
         match quote {
             Some(q) if c == q => quote = None,
-            Some(_) => {}
+            Some(_) if c.is_whitespace() || "&|;()<>{}$`".contains(c) => out.push('_'),
+            Some(_) => out.push(c),
             None if c == '\'' || c == '"' => quote = Some(c),
             None => out.push(c),
         }
@@ -34,7 +37,7 @@ static DETACH: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Why a command would leave a process running outside the Bash tool's control.
 pub fn detached(cmd: &str) -> Option<&'static str> {
-    let bare = strip_quotes(cmd);
+    let bare = strip_quotes(&strip_heredocs(cmd));
     if DETACH.is_match(&bare) {
         return Some("nohup/setsid/disown/start detach a process from the session");
     }
@@ -60,15 +63,124 @@ pub fn is_network(cmd: &str) -> bool {
     NETWORK.is_match(cmd)
 }
 
-static BUILD: LazyLock<Regex> = LazyLock::new(|| {
-    re(
-        r"\b(cargo\s+(build|test|run|check|clippy|nextest|bench)|dotnet\s+(build|test|run|publish)|msbuild|(npm|pnpm|yarn|bun)\s+(run\s+\S+|test|build|install|ci)|npx\s+(jest|vitest|tsc|playwright)|pytest|tox|go\s+(build|test|run)|make|cmake|ninja|gradlew?|mvn|godot\S*|unity|xcodebuild|tsc)\b|replay",
-    )
-});
+/// Drop heredoc bodies (`<<EOF ... EOF`), keeping the line that opens them.
+/// Their text is data, not commands.
+pub fn strip_heredocs(cmd: &str) -> String {
+    let mut out = String::with_capacity(cmd.len());
+    let mut delim: Option<String> = None;
+    for line in cmd.lines() {
+        if let Some(d) = &delim {
+            if line.trim() == d {
+                delim = None;
+            }
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+        if let Some(pos) = line.find("<<") {
+            let rest = line[pos + 2..].trim_start_matches(['-', '~']).trim_start();
+            let word: String = rest
+                .chars()
+                .filter(|c| *c != '\'' && *c != '"')
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !word.is_empty() {
+                delim = Some(word);
+            }
+        }
+    }
+    out
+}
 
-/// Builds, test runs, replays and other commands that take a while.
+/// The words of each simple command in a shell line, with heredoc bodies and
+/// quoted strings removed, and leading `VAR=value`, `sudo`, `time`, `timeout N`,
+/// `env` and `exec` skipped. `bash script.sh` is reported as `script.sh`.
+fn simple_commands(cmd: &str) -> Vec<Vec<String>> {
+    let bare = strip_quotes(&strip_heredocs(cmd));
+    bare.split(['\n', ';', '|', '&', '(', ')', '{', '}'])
+        .map(|part| {
+            let mut words: Vec<&str> = part.split_whitespace().collect();
+            loop {
+                match words.first() {
+                    Some(w) if w.contains('=') && !w.starts_with('-') => {
+                        words.remove(0);
+                    }
+                    Some(&("sudo" | "time" | "env" | "exec" | "nice" | "command")) => {
+                        words.remove(0);
+                    }
+                    Some(&"timeout") => {
+                        words.remove(0);
+                        if words
+                            .first()
+                            .is_some_and(|w| w.chars().next().is_some_and(|c| c.is_ascii_digit()))
+                        {
+                            words.remove(0);
+                        }
+                    }
+                    Some(&("bash" | "sh" | "zsh" | "pwsh" | "powershell"))
+                        if words.get(1).is_some_and(|w| !w.starts_with('-')) =>
+                    {
+                        words.remove(0);
+                    }
+                    _ => break,
+                }
+            }
+            words.iter().map(|w| w.to_string()).collect()
+        })
+        .filter(|w: &Vec<String>| !w.is_empty())
+        .collect()
+}
+
+/// Builds, test runs, replays and other commands that take a while. Judged by
+/// the program being run and its subcommand, never by words in arguments,
+/// heredocs or commit messages.
 pub fn is_build_or_test(cmd: &str) -> bool {
-    BUILD.is_match(cmd)
+    simple_commands(cmd).iter().any(|words| {
+        let exe = words[0]
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let exe = exe.strip_suffix(".exe").unwrap_or(&exe);
+        let sub = words
+            .get(1)
+            .map(|w| w.to_ascii_lowercase())
+            .unwrap_or_default();
+        let sub = sub.as_str();
+        match exe {
+            "cargo" => matches!(
+                sub,
+                "build"
+                    | "b"
+                    | "test"
+                    | "t"
+                    | "run"
+                    | "r"
+                    | "check"
+                    | "c"
+                    | "clippy"
+                    | "nextest"
+                    | "bench"
+            ),
+            "dotnet" => matches!(sub, "build" | "test" | "run" | "publish"),
+            "npm" | "pnpm" | "yarn" | "bun" => matches!(
+                sub,
+                "run" | "test" | "t" | "build" | "install" | "i" | "ci" | "start"
+            ),
+            "npx" => matches!(sub, "jest" | "vitest" | "tsc" | "playwright"),
+            "go" => matches!(sub, "build" | "test" | "run"),
+            "msbuild" | "pytest" | "tox" | "make" | "cmake" | "ninja" | "gradle" | "gradlew"
+            | "mvn" | "xcodebuild" | "tsc" | "jest" | "vitest" => true,
+            e if e.starts_with("godot") || e.starts_with("unity") => true,
+            // Project scripts like tools/run_replays.sh, build.sh, run_tests.ps1.
+            e if e.contains('.')
+                && (e.contains("replay") || e.contains("build") || e.contains("test")) =>
+            {
+                true
+            }
+            _ => false,
+        }
+    })
 }
 
 const SECRET_PATTERNS: &[&str] = &[
@@ -168,6 +280,7 @@ mod tests {
         assert!(detached("cmd &> out.log").is_none());
         assert!(detached(r#"curl "https://x.test/?a=1&b=2""#).is_none());
         assert!(detached("echo 'nohup is a word'").is_none());
+        assert!(detached("cat >> notes.md <<EOF\nR&D budget & nohup notes\nEOF").is_none());
     }
 
     #[test]
@@ -180,6 +293,10 @@ mod tests {
             "godot --headless -s x",
             "make -j8",
             "pytest -q",
+            "cd game && dotnet build",
+            "GODOT=/opt/godot bash tools/run_replays.sh smoke",
+            "timeout 600 Godot_v4.exe --headless",
+            r"'/mnt/c/Program Files/dotnet/dotnet.exe' test",
         ] {
             assert!(is_build_or_test(c), "{c}");
         }
@@ -188,6 +305,9 @@ mod tests {
             "ls src",
             "cat Makefile.md",
             "grep -rn build src",
+            "echo make it so",
+            "git commit -m 'run the replays and test the build'",
+            "cat >> docs/backlog.md <<'EOF'\n- replay unlocks via Intel\n- make the data test pass\nEOF\ngit add docs/backlog.md && git commit -q -m \"backlog\"",
         ] {
             assert!(!is_build_or_test(c), "{c}");
         }
