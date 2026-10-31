@@ -226,6 +226,18 @@ pub fn protected_path(path: &str) -> bool {
     std::env::var("CLAUDE_PLUGIN_ROOT").is_ok_and(|root| !root.is_empty() && path.contains(&root))
 }
 
+static BOOKKEEPING: LazyLock<Regex> = LazyLock::new(|| {
+    re(
+        r"[/\\]\.claude[/\\](projects[/\\][^/\\]+[/\\]memory|plans)[/\\]|[/\\]claude-[^/\\]+[/\\].*[/\\]scratchpad[/\\]",
+    )
+});
+
+/// Claude Code's own bookkeeping: auto-memory, plans, the session scratchpad.
+/// Writing these is not project work, so coordinator limits don't apply.
+pub fn bookkeeping_path(path: &str) -> bool {
+    BOOKKEEPING.is_match(path)
+}
+
 static WRITES: LazyLock<Regex> = LazyLock::new(|| {
     re(
         r">|\bsed\s+-i|\btee\b|\brm\b|\bmv\b|\bcp\b|\bchmod\b|\bSet-Content\b|\bOut-File\b|\bRemove-Item\b",
@@ -311,6 +323,22 @@ mod tests {
         ] {
             assert!(!is_build_or_test(c), "{c}");
         }
+    }
+
+    #[test]
+    fn bookkeeping() {
+        assert!(bookkeeping_path(
+            "/home/u/.claude/projects/-mnt-d-game/memory/save-format.md"
+        ));
+        assert!(bookkeeping_path("/home/u/.claude/plans/refactor.md"));
+        assert!(bookkeeping_path(
+            "/tmp/claude-1000/-mnt-d-game/1234-abcd/scratchpad/notes.md"
+        ));
+        assert!(bookkeeping_path(
+            r"C:\Users\u\.claude\projects\game\memory\x.md"
+        ));
+        assert!(!bookkeeping_path("/home/u/game/docs/memory/x.md"));
+        assert!(!bookkeeping_path("/home/u/.claude/settings.json"));
     }
 
     #[test]

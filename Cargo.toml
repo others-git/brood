@@ -1,6 +1,6 @@
 [package]
 name = "brood-cc"
-version = "0.0.4"
+version = "0.0.5"
 edition = "2024"
 description = "Claude Code plugin helper: coordinator mode, subagent process cleanup, loop and prompt-injection guards"
 license = "MIT"

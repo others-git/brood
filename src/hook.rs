@@ -390,11 +390,18 @@ fn coordinator_check(cfg: &config::Config, ev: &Value, session: &str) -> Option<
     if !WORK_TOOLS.contains(&tool) {
         return None;
     }
+    let input = &ev["tool_input"];
+    let path = input["file_path"]
+        .as_str()
+        .or(input["notebook_path"].as_str())
+        .unwrap_or_default();
+    if guard::bookkeeping_path(path) {
+        return None;
+    }
     let mut st = state::load_agent(session, COORDINATOR);
     if st.solo {
         return None;
     }
-    let input = &ev["tool_input"];
     if tool == "Bash"
         && input["run_in_background"].as_bool() != Some(true)
         && guard::is_build_or_test(input["command"].as_str().unwrap_or_default())
