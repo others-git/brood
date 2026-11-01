@@ -95,7 +95,7 @@ pub fn strip_heredocs(cmd: &str) -> String {
 /// The words of each simple command in a shell line, with heredoc bodies and
 /// quoted strings removed, and leading `VAR=value`, `sudo`, `time`, `timeout N`,
 /// `env` and `exec` skipped. `bash script.sh` is reported as `script.sh`.
-fn simple_commands(cmd: &str) -> Vec<Vec<String>> {
+pub fn simple_commands(cmd: &str) -> Vec<Vec<String>> {
     let bare = strip_quotes(&strip_heredocs(cmd));
     bare.split(['\n', ';', '|', '&', '(', ')', '{', '}'])
         .map(|part| {
@@ -129,6 +129,103 @@ fn simple_commands(cmd: &str) -> Vec<Vec<String>> {
         })
         .filter(|w: &Vec<String>| !w.is_empty())
         .collect()
+}
+
+/// Shell-comment marker that lets a `git worktree remove` of a dirty worktree through.
+pub const ALLOW_DIRTY: &str = "brood:allow-dirty";
+
+fn exe_name(word: &str) -> String {
+    let exe = word.rsplit(['/', '\\']).next().unwrap_or_default();
+    exe.strip_suffix(".exe").unwrap_or(exe).to_ascii_lowercase()
+}
+
+/// The arguments of a `git` simple command after its global options
+/// (`-C dir`, `-c k=v`, `--no-pager`...), or `None` if it isn't git.
+pub fn git_args(words: &[String]) -> Option<Vec<&str>> {
+    if exe_name(words.first()?) != "git" {
+        return None;
+    }
+    let mut i = 1;
+    while let Some(w) = words.get(i).filter(|w| w.starts_with('-')) {
+        i += if matches!(w.as_str(), "-C" | "-c") {
+            2
+        } else {
+            1
+        };
+    }
+    Some(words.iter().skip(i).map(String::as_str).collect())
+}
+
+/// Paths named by each `git worktree remove [--force|-f] <path>` in `cmd`.
+pub fn worktree_removals(cmd: &str) -> Vec<String> {
+    simple_commands(cmd)
+        .iter()
+        .filter_map(|words| {
+            let args = git_args(words)?;
+            if args.first() != Some(&"worktree") || !matches!(args.get(1), Some(&"remove")) {
+                return None;
+            }
+            args[2..]
+                .iter()
+                .find(|a| !a.starts_with('-'))
+                .map(|a| a.to_string())
+        })
+        .collect()
+}
+
+/// The simple commands in `cmd` that merge branches, delete a branch or
+/// worktree, or run a script whose name says it merges. With `sync`, also
+/// `git pull`, `rebase` and `cherry-pick` (which can fail the same way).
+pub fn merge_commands(cmd: &str, sync: bool) -> Vec<Vec<String>> {
+    simple_commands(cmd)
+        .into_iter()
+        .filter(|words| {
+            if let Some(args) = git_args(words) {
+                return match args.first().copied() {
+                    Some("merge") => true,
+                    Some("pull" | "rebase" | "cherry-pick") => sync,
+                    Some("branch") => args.iter().skip(1).any(|a| {
+                        *a == "--delete"
+                            || (a.starts_with('-')
+                                && !a.starts_with("--")
+                                && a.contains(['d', 'D']))
+                    }),
+                    Some("worktree") => args.get(1) == Some(&"remove"),
+                    _ => false,
+                };
+            }
+            let interp = matches!(
+                exe_name(&words[0]).as_str(),
+                "python" | "python3" | "node" | "ruby" | "perl"
+            );
+            let n = if interp { 2 } else { 1 };
+            words
+                .iter()
+                .take(n)
+                .any(|w| exe_name(w).contains("merge") && !w.starts_with('-'))
+        })
+        .collect()
+}
+
+/// Whether every simple command in `cmd` is `git ...` or matches one of `free`.
+pub fn all_free(cmd: &str, free: &[Regex]) -> bool {
+    let cmds = simple_commands(cmd);
+    !cmds.is_empty()
+        && cmds
+            .iter()
+            .all(|w| git_args(w).is_some() || free.iter().any(|r| r.is_match(&w.join(" "))))
+}
+
+static MERGE_FAILED: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"Automatic merge failed|CONFLICT \(|Please commit your changes or stash them before you merge|error: Your local changes to the following files would be overwritten by merge|fatal: refusing to merge unrelated histories|not something we can merge|Merge with strategy .* failed",
+    )
+    .expect("valid builtin regex")
+});
+
+/// Whether tool output shows a failed `git merge` (case-sensitive: git's own wording).
+pub fn merge_failed(text: &str) -> bool {
+    MERGE_FAILED.is_match(text)
 }
 
 /// Builds, test runs, replays and other commands that take a while. Judged by
@@ -380,5 +477,75 @@ mod tests {
                 .contains(&"fake-chat-tags".to_string())
         );
         assert!(injection_hits("A normal article about Rust lifetimes.", &[]).is_empty());
+    }
+
+    #[test]
+    fn worktree_remove_parsing() {
+        assert_eq!(
+            worktree_removals("git worktree remove .claude/worktrees/agent-1"),
+            vec![".claude/worktrees/agent-1"]
+        );
+        assert_eq!(
+            worktree_removals("cd x && git worktree remove --force ../wt && git branch -D b"),
+            vec!["../wt"]
+        );
+        assert_eq!(
+            worktree_removals("git -C repo worktree remove -f wt"),
+            vec!["wt"]
+        );
+        assert_eq!(
+            worktree_removals("git worktree remove wt # brood:allow-dirty"),
+            vec!["wt"]
+        );
+        assert!(worktree_removals("git worktree list").is_empty());
+        assert!(worktree_removals("echo 'git worktree remove wt'").is_empty());
+        assert!(worktree_removals("cat <<EOF\ngit worktree remove x\nEOF").is_empty());
+    }
+
+    #[test]
+    fn merge_and_remove_detection() {
+        let m = |c: &str| !merge_commands(c, false).is_empty();
+        assert!(m("git merge worktree-agent-1"));
+        assert!(m("git -C r branch -D foo"));
+        assert!(m("git branch --delete foo"));
+        assert!(m("git worktree remove x"));
+        assert!(m("bash tools/merge_all.sh a b"));
+        assert!(!m("git status"));
+        assert!(!m("git branch -a"));
+        assert!(!m("echo merge"));
+        assert!(!m("git pull"));
+        assert!(!merge_commands("git pull && git rebase main", true).is_empty());
+        assert!(merge_commands("git cherry-pick abc", true).len() == 1);
+    }
+
+    #[test]
+    fn merge_failure_detection() {
+        assert!(merge_failed(
+            "Auto-merging a.rs\nCONFLICT (content): Merge conflict in a.rs"
+        ));
+        assert!(merge_failed(
+            "Automatic merge failed; fix conflicts and then commit the result."
+        ));
+        assert!(merge_failed(
+            "error: Your local changes to the following files would be overwritten by merge:\n\ta"
+        ));
+        assert!(merge_failed(
+            "error: Please commit your changes or stash them before you merge."
+        ));
+        assert!(merge_failed("fatal: refusing to merge unrelated histories"));
+        assert!(merge_failed("merge: foo - not something we can merge"));
+        assert!(merge_failed("Merge with strategy ort failed."));
+        assert!(!merge_failed("conflict ( lowercase is not git's wording"));
+        assert!(!merge_failed("Merge made by the 'ort' strategy.\nmerged"));
+    }
+
+    #[test]
+    fn git_only_commands_are_free() {
+        let free = vec![Regex::new(r"^make lint$").unwrap()];
+        assert!(all_free("git merge x && git branch -d x", &free));
+        assert!(all_free("git status\ngit log --oneline", &free));
+        assert!(all_free("make lint", &free));
+        assert!(!all_free("git status && ls", &free));
+        assert!(!all_free("", &free));
     }
 }

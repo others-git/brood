@@ -18,6 +18,9 @@ pub struct Config {
     pub main_tool_budget: u32,
     /// Largest edit (in lines) the main session may make itself in coordinator mode.
     pub trivial_edit_lines: u32,
+    /// Regexes for shell commands that don't count toward the work budget
+    /// (matched against each simple command). Commands made only of `git` are always free.
+    pub free_commands: Vec<String>,
     /// Tools whose output is scanned for prompt injection (regex on tool name).
     pub scan_tools: String,
     /// Extra regexes for secrets that must never leave the machine.
@@ -35,6 +38,7 @@ impl Default for Config {
             max_helpers: 3,
             main_tool_budget: 3,
             trivial_edit_lines: 10,
+            free_commands: vec![],
             scan_tools: r"^(WebFetch|WebSearch|mcp__.*)$".into(),
             extra_secret_patterns: vec![],
             extra_injection_patterns: vec![],

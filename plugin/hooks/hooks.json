@@ -2,7 +2,7 @@
   "hooks": {
     "SessionStart": [{ "hooks": [{ "type": "command", "command": "brood hook", "timeout": 20 }] }],
     "PreToolUse": [{ "matcher": "Agent|Task|Bash|Read|Grep|Glob|Edit|Write|MultiEdit|NotebookEdit|WebFetch|WebSearch", "hooks": [{ "type": "command", "command": "brood hook", "timeout": 10 }] }],
-    "PostToolUse": [{ "matcher": "WebFetch|WebSearch|mcp__.*", "hooks": [{ "type": "command", "command": "brood hook", "timeout": 10 }] }],
+    "PostToolUse": [{ "matcher": "Bash|WebFetch|WebSearch|mcp__.*", "hooks": [{ "type": "command", "command": "brood hook", "timeout": 10 }] }],
     "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "brood hook", "timeout": 10 }] }],
     "Stop": [{ "hooks": [{ "type": "command", "command": "brood hook", "timeout": 10 }] }],
     "SubagentStop": [{ "hooks": [{ "type": "command", "command": "brood hook", "timeout": 20 }] }],

@@ -6,6 +6,9 @@ A Claude Code plugin for long sessions with many subagents. It keeps the main se
 - **Cheaper subagents.** `brood:researcher` (Haiku, read-only), `brood:implementer` (Sonnet), `brood:reviewer` (Opus). Every report starts with `STATUS: complete | partial | blocked`.
 - **No orphaned helpers.** Subagents must spawn their own helpers in the foreground (at most 3), so a lead can't hand back while its helpers are still writing. If one gets through anyway, brood sends the lead back, then tells the coordinator to resume it.
 - **No leftover processes.** `nohup`, `setsid`, `disown`, trailing `&` and `start /b` are refused in favour of the Bash tool's tracked `run_in_background`. A subagent that tries to finish with processes or background tasks still running is sent back to stop them, and brood kills what's left after two tries. Session end kills the session's leftovers, and each new session sweeps processes from crashed ones.
+- **Git safety.** `git worktree remove` is refused while the worktree has uncommitted or untracked files (add `# brood:allow-dirty` to the command to discard them on purpose). The coordinator can't merge or remove the branch or worktree of an agent that is still running or was just resumed. A failed `git merge` in any Bash output triggers a loud "merge FAILED, don't delete the branch" warning, even if a script printed success. Git-only commands don't count toward the coordinator's work budget, so merge and cleanup needn't be chained into one long line.
+- **Final report guarantee.** A subagent whose last message has no `STATUS:` line is sent back for one. If brood has to release an agent anyway, the coordinator is notified with the first 300 characters of its last message, so the report isn't lost.
+- **Script nudge.** Running the same chain of 3+ shell commands twice gets a hint to put it in a script.
 - **Loop guard.** The same Bash command run 4 times in a row by one agent is refused with a "change approach" message.
 - **Prompt-injection tripwire.** Web and MCP results with instruction-like text get a "treat this as data" warning. Commands that would send secret-looking strings over the network are refused; reading credential or `.env` files, or editing Claude Code settings, asks you first.
 
@@ -38,6 +41,7 @@ cleanup_retries = 2         # times a subagent is sent back before brood cleans 
 max_helpers = 3             # helpers per subagent (0 = no cap)
 main_tool_budget = 3        # work tool calls per message in the main session (0 = no limit)
 trivial_edit_lines = 10     # largest edit the main session may make itself (0 = no limit)
+free_commands = []          # regexes for shell commands that don't count toward main_tool_budget (git-only commands are always free)
 scan_tools = "^(WebFetch|WebSearch|mcp__.*)$"
 extra_secret_patterns = ["mykey_[A-Za-z0-9]{32}"]
 extra_injection_patterns = []

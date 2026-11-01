@@ -44,6 +44,8 @@ pub struct AgentState {
     pub streak: u32,
     pub cleanup_blocks: u32,
     pub helpers_spawned: u32,
+    /// Command chains already nudged toward a script (once per distinct command).
+    pub nudged: Vec<String>,
     /// Main session only: work tool calls since the user's last message.
     pub turn_calls: u32,
     /// Main session only: the user said `#solo`, so this turn may work inline.
