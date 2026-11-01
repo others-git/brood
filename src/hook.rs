@@ -89,6 +89,16 @@ fn pre_tool(cfg: &config::Config, ev: &Value, session: &str, agent: &str) -> Opt
         return deny(r);
     }
     match ev["tool_name"].as_str().unwrap_or_default() {
+        // A general-purpose agent silently inherits the session's (often most
+        // expensive) model; make the coordinator choose a brood agent or a model.
+        "Agent" | "Task" if agent == COORDINATOR && cfg.coordinator => {
+            let kind = input["subagent_type"].as_str().unwrap_or("general-purpose");
+            let has_model = input["model"].as_str().is_some_and(|m| !m.is_empty());
+            if matches!(kind, "general-purpose" | "claude") && !has_model {
+                return deny("pick a brood agent: brood:researcher (lookups), brood:implementer (code, docs, proposals), brood:reviewer (review, debugging). If none fits, spawn general-purpose with `model` set explicitly (e.g. sonnet or haiku); without one it inherits this session's model.".into());
+            }
+            None
+        }
         // The main session may background agents; it has a user to stay responsive for.
         "Agent" | "Task" if agent != COORDINATOR => {
             if input["run_in_background"].as_bool() == Some(true) {
