@@ -1,7 +1,7 @@
 //! `brood hook`: one entry point for every hook event the plugin registers.
 //! Reads the event JSON on stdin, prints a hook response (or nothing) on stdout.
 
-use crate::{config, guard, procs, state};
+use crate::{config, guard, kanban, procs, state};
 use anyhow::Result;
 use serde_json::{Value, json};
 use std::io::Read;
@@ -23,13 +23,13 @@ pub fn run() -> Result<()> {
     let agent = ev["agent_id"].as_str().unwrap_or(COORDINATOR).to_owned();
 
     let out = match ev["hook_event_name"].as_str().unwrap_or_default() {
-        "SessionStart" => session_start(&cfg, &session),
+        "SessionStart" => session_start(&cfg, &ev, &session),
         "PreToolUse" => pre_tool(&cfg, &ev, &session, &agent),
         "PostToolUse" => post_tool(&cfg, &ev, &session, &agent),
         "SubagentStop" if agent != COORDINATOR => subagent_stop(&cfg, &ev, &session, &agent),
         "UserPromptSubmit" => user_prompt(&cfg, &ev, &session),
-        "Stop" => main_stop(&session),
-        "SessionEnd" => session_end(&session),
+        "Stop" => main_stop(&cfg, &session),
+        "SessionEnd" => session_end(&cfg, &session),
         _ => None,
     };
     if let Some(v) = out {
@@ -38,7 +38,17 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-fn session_start(cfg: &config::Config, session: &str) -> Option<Value> {
+const KANBAN_FALLBACK: &str = include_str!("../plugin/context/kanban.md");
+
+const MIGRATION_HINT: &str = "This project has no kanban board yet. Find planning docs (TODO/backlog/roadmap/plan files, task lists in docs/ or README) and propose turning their open items into cards in the right columns. Ask the user before creating cards. Keep the original docs; just note in them that the items moved to kanban/. Delegate the migration to a subagent.";
+
+/// The one-time board-migration hint: only inside a git project that has no `kanban/` dir yet.
+fn migration_hint(git_root: Option<&str>) -> Option<&'static str> {
+    let root = kanban::paths::native(&kanban::paths::normalize(git_root?));
+    kanban::store::needs_migration_hint(&root).then_some(MIGRATION_HINT)
+}
+
+fn session_start(cfg: &config::Config, ev: &Value, session: &str) -> Option<Value> {
     let killed = procs::gc(false);
     if !killed.is_empty() {
         state::log(
@@ -50,18 +60,38 @@ fn session_start(cfg: &config::Config, session: &str) -> Option<Value> {
         );
     }
     state::prune_old_sessions();
-    if !cfg.coordinator {
+    let plugin_file = |name: &str, fallback: &str| {
+        // Prefer the plugin's copy so the prompt can be edited without a rebuild.
+        std::env::var("CLAUDE_PLUGIN_ROOT")
+            .ok()
+            .and_then(|root| {
+                std::fs::read_to_string(std::path::Path::new(&root).join("context").join(name)).ok()
+            })
+            .unwrap_or_else(|| fallback.to_owned())
+    };
+    let mut parts = vec![];
+    if cfg.coordinator {
+        parts.push(plugin_file("coordinator.md", COORDINATOR_FALLBACK));
+    }
+    if cfg.kanban {
+        let cwd = ev["cwd"].as_str().unwrap_or(".");
+        let top = kanban::paths::git_toplevel(cwd);
+        if kanban::client::ensure_board(cfg) && !session.is_empty() {
+            let root = top.as_deref().unwrap_or(cwd);
+            let pid = procs::current_claude_pid().unwrap_or(0);
+            kanban::client::register_session(cfg, session, cwd, root, pid);
+        }
+        if cfg.coordinator {
+            parts.push(plugin_file("kanban.md", KANBAN_FALLBACK));
+        }
+        // Once per session start, never per prompt.
+        parts.extend(migration_hint(top.as_deref()).map(str::to_owned));
+    }
+    if parts.is_empty() {
         return None;
     }
-    // Prefer the plugin's copy so the prompt can be edited without a rebuild.
-    let prompt = std::env::var("CLAUDE_PLUGIN_ROOT")
-        .ok()
-        .and_then(|root| {
-            std::fs::read_to_string(std::path::Path::new(&root).join("context/coordinator.md")).ok()
-        })
-        .unwrap_or_else(|| COORDINATOR_FALLBACK.to_owned());
     Some(json!({
-        "hookSpecificOutput": { "hookEventName": "SessionStart", "additionalContext": prompt }
+        "hookSpecificOutput": { "hookEventName": "SessionStart", "additionalContext": parts.join("\n\n") }
     }))
 }
 
@@ -740,6 +770,16 @@ fn user_prompt(cfg: &config::Config, ev: &Value, session: &str) -> Option<Value>
     if cfg.coordinator && !st.solo {
         parts.push(TURN_REMINDER.to_owned());
     }
+    if cfg.kanban && !session.is_empty() {
+        let cards = kanban::client::take_sent(cfg, session, 100);
+        if !cards.is_empty() {
+            let list: Vec<String> = cards.iter().map(sent_card_text).collect();
+            parts.push(format!(
+                "Cards were sent to this session from the kanban board. Claim each (kanban_claim), work it, move it to review:\n\n{}",
+                list.join("\n\n---\n\n")
+            ));
+        }
+    }
     let notices = state::take_notices(session);
     if !notices.is_empty() {
         parts.push(format!("brood notices:\n- {}", notices.join("\n- ")));
@@ -757,7 +797,7 @@ fn user_prompt(cfg: &config::Config, ev: &Value, session: &str) -> Option<Value>
 
 /// End of a main-session turn. Background-agent results can start new turns
 /// without a user message, so the per-message budget resets here too.
-fn main_stop(session: &str) -> Option<Value> {
+fn main_stop(cfg: &config::Config, session: &str) -> Option<Value> {
     let mut st = state::load_agent(session, COORDINATOR);
     st.turn_calls = 0;
     st.turn_files.clear();
@@ -766,10 +806,35 @@ fn main_stop(session: &str) -> Option<Value> {
     st.pending_nudge = None;
     st.solo = false;
     state::save_agent(session, COORDINATOR, &st);
+    // A card sent while the session was working: hand it over now, one per stop.
+    if cfg.kanban
+        && !session.is_empty()
+        && let Some(card) = kanban::client::take_sent(cfg, session, 1).first()
+    {
+        return Some(json!({
+            "decision": "block",
+            "reason": format!(
+                "A card was sent to you from the kanban board. Claim it (kanban_claim), work it, then move it to review.\n\n{}",
+                sent_card_text(card)
+            ),
+        }));
+    }
     None
 }
 
-fn session_end(session: &str) -> Option<Value> {
+fn sent_card_text(c: &Value) -> String {
+    format!(
+        "Card {} : {}\n\n{}",
+        c["card"].as_str().unwrap_or_default(),
+        c["title"].as_str().unwrap_or_default(),
+        c["body"].as_str().unwrap_or_default()
+    )
+}
+
+fn session_end(cfg: &config::Config, session: &str) -> Option<Value> {
+    if cfg.kanban && !session.is_empty() {
+        kanban::client::unregister_session(cfg, session);
+    }
     let killed = procs::kill_session(session);
     if !killed.is_empty() {
         let list: Vec<String> = killed
@@ -795,6 +860,18 @@ fn truncate(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migration_hint_trigger() {
+        assert!(migration_hint(None).is_none()); // not a git project
+        let d = std::env::temp_dir().join(format!("brood-hint-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.to_string_lossy().into_owned();
+        assert!(migration_hint(Some(&p)).is_some());
+        std::fs::create_dir_all(d.join("kanban")).unwrap();
+        assert!(migration_hint(Some(&p)).is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn edit_sizes() {

@@ -115,9 +115,15 @@ impl Snapshot {
 
     /// brood itself and the chain that launched it (Claude, shells). Never kill these.
     fn protected(&self) -> HashSet<u32> {
+        self.protected_with(crate::kanban::board::lock_pid())
+    }
+
+    /// `protected`, plus the kanban board's pid: it is not a session leftover.
+    fn protected_with(&self, board: Option<u32>) -> HashSet<u32> {
         let me = std::process::id();
         let mut set: HashSet<u32> = self.ancestors(me).into_iter().collect();
         set.insert(me);
+        set.extend(board);
         set
     }
 
@@ -127,6 +133,42 @@ impl Snapshot {
             .and_then(|c| self.procs.get(&c))
             .is_some_and(|c| c.start <= p.start)
     }
+}
+
+/// The Claude Code process above this one, if any.
+pub fn current_claude_pid() -> Option<u32> {
+    snapshot().session_claude()
+}
+
+/// Which of these pids are running now.
+pub fn alive_pids(pids: &[u32]) -> HashSet<u32> {
+    let Ok(mut sys) = System::new() else {
+        return pids.iter().copied().collect(); // cannot tell: assume alive
+    };
+    let list: Vec<Pid> = pids.iter().map(|p| Pid::from_u32(*p)).collect();
+    sys.refresh_processes(ProcessesToUpdate::Some(&list), true);
+    pids.iter()
+        .copied()
+        .filter(|p| sys.process(Pid::from_u32(*p)).is_some())
+        .collect()
+}
+
+/// Command line of a running process.
+pub fn pid_cmd(pid: u32) -> Option<String> {
+    let mut sys = System::new().ok()?;
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
+        true,
+        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+    );
+    let p = sys.process(Pid::from_u32(pid))?;
+    Some(
+        p.cmd()
+            .iter()
+            .map(|a| a.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
 }
 
 /// The Bash tool runs commands as `bash -c "source .../shell-snapshots/snapshot-... && eval '<cmd>' && pwd -P ..."`.
@@ -331,6 +373,16 @@ mod tests {
             Some(r"tr '\0' x && echo done")
         );
         assert_eq!(eval_command("node server.js"), None);
+    }
+
+    #[test]
+    fn gc_protects_board_pid() {
+        let snap = Snapshot {
+            sys: None,
+            procs: HashMap::new(),
+        };
+        assert!(snap.protected_with(Some(424242)).contains(&424242));
+        assert!(!snap.protected_with(None).contains(&424242));
     }
 
     #[test]

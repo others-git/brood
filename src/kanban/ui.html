@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>brood board</title>
+<style>
+:root{--bg:#f4f5f7;--fg:#1c2128;--mut:#6a737d;--col:#e6e8ec;--card:#fff;--bd:#d0d4da;--acc:#2563eb;--warn:#b45309}
+@media (prefers-color-scheme:dark){:root{--bg:#14171c;--fg:#e4e7eb;--mut:#8b95a1;--col:#1d2128;--card:#262b33;--bd:#38404a;--acc:#6ea0ff;--warn:#f0b35c}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.4 system-ui,sans-serif;height:100vh;display:flex;flex-direction:column}
+header{display:flex;gap:10px;align-items:center;padding:8px 12px;border-bottom:1px solid var(--bd)}
+header h1{font-size:15px;margin:0}
+select,input,textarea,button{font:inherit;color:inherit;background:var(--card);border:1px solid var(--bd);border-radius:4px;padding:4px 8px}
+button{cursor:pointer}button.pri{background:var(--acc);color:#fff;border-color:var(--acc)}
+#msg{margin-left:auto;color:var(--warn)}
+#board{flex:1;display:flex;gap:10px;padding:12px;overflow-x:auto}
+.col{flex:1 0 220px;max-width:340px;background:var(--col);border-radius:6px;display:flex;flex-direction:column;min-height:0}
+.col h2{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--mut);margin:0;padding:8px 10px}
+.col.over{outline:2px dashed var(--acc)}
+.cards{flex:1;overflow-y:auto;padding:0 8px 8px;display:flex;flex-direction:column;gap:6px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:5px;padding:7px 9px;cursor:pointer}
+.card .t{font-weight:600}.card .m{color:var(--mut);font-size:12px;margin-top:3px}
+.tag{border:1px solid var(--bd);border-radius:9px;padding:0 6px;margin-right:3px}
+dialog{background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:8px;width:min(640px,94vw)}
+dialog::backdrop{background:#0006}
+dialog input,dialog textarea{width:100%;margin:4px 0 10px}dialog textarea{height:240px;font-family:ui-monospace,monospace}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+</style>
+</head>
+<body>
+<header>
+  <h1>brood board</h1>
+  <select id="proj" title="Project"></select>
+  <button id="new" class="pri">New card</button>
+  <span id="msg"></span>
+</header>
+<div id="board"></div>
+<dialog id="dlg">
+  <form method="dialog" id="form">
+    <label>Title<input id="f-title"></label>
+    <label>Description<textarea id="f-body"></textarea></label>
+    <div class="row">
+      <label>Priority <select id="f-prio"><option>low</option><option>normal</option><option>high</option></select></label>
+      <label>Tags <input id="f-tags" style="width:200px;margin:0" placeholder="comma separated"></label>
+    </div>
+    <p class="m" id="f-info" style="color:var(--mut);font-size:12px"></p>
+    <div class="row">
+      <button type="button" id="save" class="pri">Save</button>
+      <button type="button" id="cancel">Close</button>
+      <span style="flex:1"></span>
+      <select id="f-sess"></select>
+      <button type="button" id="send">Send to session</button>
+    </div>
+  </form>
+</dialog>
+<script>
+"use strict";
+const token = new URLSearchParams(location.search).get("token") || "";
+const $ = id => document.getElementById(id);
+let projects = [], columns = [], cards = [], project = localStorage.getItem("brood-project") || "", editing = null;
+
+async function api(method, path, body) {
+  const r = await fetch(path, {method, headers: {"X-Brood-Token": token, "Content-Type": "application/json"}, body: body ? JSON.stringify(body) : undefined});
+  let data = null; try { data = await r.json(); } catch (e) {}
+  return {status: r.status, data};
+}
+let msgTimer;
+function note(t) { $("msg").textContent = t; clearTimeout(msgTimer); msgTimer = setTimeout(() => $("msg").textContent = "", 5000); }
+
+async function loadProjects() {
+  const r = await api("GET", "/api/projects");
+  if (r.status !== 200) { note("auth failed: open the URL printed with its token"); return; }
+  projects = r.data.projects; columns = r.data.columns;
+  if (!projects.find(p => p.id === project)) {
+    const live = projects.find(p => p.sessions > 0) || projects[0];
+    project = live ? live.id : "";
+  }
+  $("proj").innerHTML = projects.map(p => `<option value="${p.id}">${esc(p.name)} (${p.sessions})</option>`).join("");
+  $("proj").value = project;
+  await loadCards();
+}
+async function loadCards() {
+  if (!project) { cards = []; render(); return; }
+  const r = await api("GET", `/api/projects/${project}/cards`);
+  if (r.status === 200) { cards = r.data.cards; columns = r.data.columns; }
+  render();
+}
+function esc(s) { return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+
+function render() {
+  $("board").innerHTML = "";
+  for (const col of columns) {
+    const el = document.createElement("section"); el.className = "col";
+    const list = cards.filter(c => c.column === col);
+    el.innerHTML = `<h2>${esc(col)} (${list.length})</h2><div class="cards"></div>`;
+    const box = el.querySelector(".cards");
+    for (const c of list) {
+      const d = document.createElement("div"); d.className = "card"; d.draggable = true;
+      d.innerHTML = `<div class="t">${esc(c.title)}</div><div class="m">${c.tags.map(t => `<span class="tag">${esc(t)}</span>`).join("")}${c.priority !== "normal" ? esc(c.priority) + " " : ""}${c.owner ? "claimed " + esc(c.owner.slice(0, 8)) : ""}</div>`;
+      d.ondragstart = e => e.dataTransfer.setData("text/plain", c.id);
+      d.onclick = () => openCard(c);
+      box.appendChild(d);
+    }
+    el.ondragover = e => { e.preventDefault(); el.classList.add("over"); };
+    el.ondragleave = () => el.classList.remove("over");
+    el.ondrop = async e => {
+      e.preventDefault(); el.classList.remove("over");
+      const c = cards.find(x => x.id === e.dataTransfer.getData("text/plain"));
+      if (!c || c.column === col) return;
+      const r = await api("POST", `/api/projects/${project}/cards/${c.id}/move`, {rev: c.rev, column: col});
+      if (r.status === 409) note("changed elsewhere, reloaded");
+      else if (r.status !== 200) note(r.data && r.data.error || "move failed");
+      await loadCards();
+    };
+    $("board").appendChild(el);
+  }
+}
+
+async function openCard(c) {
+  editing = c;
+  $("f-title").value = c.title; $("f-body").value = c.body; $("f-prio").value = c.priority; $("f-tags").value = c.tags.join(", ");
+  $("f-info").textContent = `${c.id}  rev ${c.rev}  updated ${c.updated}`;
+  $("send").style.display = $("f-sess").style.display = "";
+  const s = await api("GET", `/api/projects/${project}/sessions`);
+  const list = s.status === 200 ? s.data.sessions : [];
+  $("f-sess").innerHTML = list.length ? list.map(x => `<option value="${esc(x.session)}">${esc(x.session.slice(0, 8))} ${esc(x.cwd.split(/[\\/]/).pop())}</option>`).join("") : `<option value="">no live sessions</option>`;
+  $("dlg").showModal();
+}
+$("new").onclick = () => {
+  editing = null;
+  $("f-title").value = ""; $("f-body").value = ""; $("f-prio").value = "normal"; $("f-tags").value = "";
+  $("f-info").textContent = "New card in " + columns[0];
+  $("send").style.display = $("f-sess").style.display = "none";
+  $("dlg").showModal();
+};
+$("cancel").onclick = () => $("dlg").close();
+$("save").onclick = async () => {
+  const body = {title: $("f-title").value, body: $("f-body").value, priority: $("f-prio").value,
+    tags: $("f-tags").value.split(",").map(t => t.trim()).filter(Boolean)};
+  if (!body.title.trim()) { note("title required"); return; }
+  let r;
+  if (editing) r = await api("PATCH", `/api/projects/${project}/cards/${editing.id}`, {...body, rev: editing.rev});
+  else r = await api("POST", `/api/projects/${project}/cards`, body);
+  if (r.status === 409) note("changed elsewhere, reloaded");
+  else if (r.status >= 400) { note(r.data && r.data.error || "save failed"); return; }
+  $("dlg").close(); await loadCards();
+};
+$("send").onclick = async () => {
+  const session = $("f-sess").value;
+  if (!session || !editing) { note("no session to send to"); return; }
+  const r = await api("POST", `/api/projects/${project}/cards/${editing.id}/send`, {session});
+  note(r.status === 200 ? "queued for session " + session.slice(0, 8) : (r.data && r.data.error || "send failed"));
+};
+$("proj").onchange = () => { project = $("proj").value; localStorage.setItem("brood-project", project); loadCards(); };
+
+function listen() {
+  const es = new EventSource("/api/events?token=" + encodeURIComponent(token));
+  es.onmessage = e => {
+    const ev = JSON.parse(e.data);
+    if (ev.type === "cards" && ev.project === project && !$("dlg").open) loadCards();
+    else if (ev.type !== "cards") loadProjects();
+  };
+}
+loadProjects(); listen();
+</script>
+</body>
+</html>

@@ -1,0 +1,5 @@
+{
+  "mcpServers": {
+    "brood": { "command": "brood", "args": ["mcp"] }
+  }
+}

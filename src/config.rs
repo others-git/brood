@@ -2,7 +2,7 @@
 
 use serde::Deserialize;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(default)]
 pub struct Config {
     /// Inject the coordinator prompt at session start. Env `BROOD_COORDINATOR=0` also disables it.
@@ -31,6 +31,14 @@ pub struct Config {
     pub extra_injection_patterns: Vec<String>,
     /// Extra junk patterns (`name/` or `*.ext`) the worktree-remove guard ignores for untracked files.
     pub worktree_junk: Vec<String>,
+    /// Enable the kanban board (board server, MCP tools, hook delivery). Env `BROOD_KANBAN=1/0` overrides.
+    pub kanban: bool,
+    /// Port of the per-machine board server (127.0.0.1 only). Env `BROOD_KANBAN_PORT` overrides.
+    pub kanban_port: u16,
+    /// With kanban on, `brood mcp` also pushes sent cards as Claude Code channel events (research preview).
+    pub kanban_push: bool,
+    /// Board columns, left to right. Each is a directory under `<project>/kanban/`.
+    pub kanban_columns: Vec<String>,
 }
 
 impl Default for Config {
@@ -48,8 +56,18 @@ impl Default for Config {
             extra_secret_patterns: vec![],
             extra_injection_patterns: vec![],
             worktree_junk: vec![],
+            kanban: false,
+            kanban_port: 47777,
+            kanban_push: true,
+            kanban_columns: default_columns(),
         }
     }
+}
+
+pub fn default_columns() -> Vec<String> {
+    ["backlog", "ready", "in-progress", "review", "done"]
+        .map(String::from)
+        .to_vec()
 }
 
 pub fn load() -> Config {
@@ -60,6 +78,27 @@ pub fn load() -> Config {
         .unwrap_or_default();
     if std::env::var("BROOD_COORDINATOR").is_ok_and(|v| v == "0" || v == "false") {
         cfg.coordinator = false;
+    }
+    match std::env::var("BROOD_KANBAN").as_deref() {
+        Ok("1" | "true") => cfg.kanban = true,
+        Ok("0" | "false") => cfg.kanban = false,
+        _ => {}
+    }
+    if let Some(p) = std::env::var("BROOD_KANBAN_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        cfg.kanban_port = p;
+    }
+    // Column names are directory names: keep them plain.
+    cfg.kanban_columns.retain(|c| {
+        !c.is_empty()
+            && c.chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    });
+    cfg.kanban_columns.dedup();
+    if cfg.kanban_columns.is_empty() {
+        cfg.kanban_columns = default_columns();
     }
     cfg
 }

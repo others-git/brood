@@ -12,6 +12,9 @@ use std::time::{Duration, SystemTime};
 const KEEP_SESSIONS_FOR: Duration = Duration::from_secs(7 * 24 * 3600);
 
 pub fn root() -> PathBuf {
+    if let Some(d) = std::env::var_os("BROOD_DATA_DIR").filter(|d| !d.is_empty()) {
+        return PathBuf::from(d);
+    }
     dirs::data_local_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("brood")

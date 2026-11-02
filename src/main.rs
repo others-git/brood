@@ -6,6 +6,7 @@
 mod config;
 mod guard;
 mod hook;
+mod kanban;
 mod merge;
 mod procs;
 mod state;
@@ -31,6 +32,14 @@ enum Cmd {
     },
     /// Show live processes that belong to Claude Code sessions.
     Ps,
+    /// Run the kanban board server (one per machine), or with --ensure start it if it is down.
+    Board {
+        /// Start a detached board if none answers, then exit.
+        #[arg(long)]
+        ensure: bool,
+    },
+    /// Stdio MCP server for the kanban tools (started by the plugin).
+    Mcp,
     /// Merge a worktree agent's branch, optionally verify, then remove its worktree and branch.
     Merge {
         /// Branch name or worktree path.
@@ -61,9 +70,17 @@ fn main() {
             }
             if !dry_run {
                 state::prune_old_sessions();
+                let n = kanban::board::sweep_dead_locks();
+                if n > 0 {
+                    println!("{n} stale kanban lock(s) removed");
+                }
             }
             println!("{} process(es)", killed.len());
         }
+        Cmd::Board { ensure } => {
+            std::process::exit(kanban::board::run(&config::load(), ensure));
+        }
+        Cmd::Mcp => std::process::exit(kanban::mcp::run(&config::load())),
         Cmd::Merge {
             target,
             verify,
