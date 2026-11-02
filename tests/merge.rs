@@ -9,7 +9,11 @@ fn git(dir: &Path, args: &[&str]) -> Output {
         .args(args)
         .output()
         .unwrap();
-    assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+    assert!(
+        o.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
     o
 }
 
@@ -26,7 +30,10 @@ fn repo(name: &str) -> PathBuf {
 
 fn worktree(d: &Path, branch: &str) -> PathBuf {
     let w = d.join("wt").join(branch);
-    git(d, &["worktree", "add", "-q", "-b", branch, w.to_str().unwrap()]);
+    git(
+        d,
+        &["worktree", "add", "-q", "-b", branch, w.to_str().unwrap()],
+    );
     w
 }
 
@@ -37,7 +44,10 @@ fn brood(d: &Path, args: &[&str]) -> (i32, String) {
         .current_dir(d)
         .output()
         .unwrap();
-    (o.status.code().unwrap(), String::from_utf8_lossy(&o.stdout).into_owned())
+    (
+        o.status.code().unwrap(),
+        String::from_utf8_lossy(&o.stdout).into_owned(),
+    )
 }
 
 fn branches(d: &Path) -> String {
@@ -55,7 +65,10 @@ fn clean_merge_with_pycache_and_verify() {
     std::fs::write(w.join("__pycache__/a.pyc"), "x").unwrap();
     let (code, out) = brood(&d, &["agent-a", "--verify", "test -f new.txt"]);
     assert_eq!(code, 0, "{out}");
-    assert!(out.contains("merged agent-a (1 commits), verify ok"), "{out}");
+    assert!(
+        out.contains("merged agent-a (1 commits), verify ok"),
+        "{out}"
+    );
     assert!(d.join("new.txt").exists());
     assert!(!w.exists());
     assert!(!branches(&d).contains("agent-a"));
@@ -83,7 +96,10 @@ fn verify_failure_keeps_everything() {
     git(&w, &["commit", "-qm", "v"]);
     let (code, out) = brood(&d, &["agent-v", "--verify", "echo boom; exit 3"]);
     assert_eq!(code, 1);
-    assert!(out.contains("boom") && out.contains("brood-verify.log"), "{out}");
+    assert!(
+        out.contains("boom") && out.contains("brood-verify.log"),
+        "{out}"
+    );
     assert!(w.exists() && branches(&d).contains("agent-v"));
 }
 
@@ -97,7 +113,10 @@ fn conflict_keeps_everything() {
     git(&d, &["commit", "-qam", "ours"]);
     let (code, out) = brood(&d, &["agent-c"]);
     assert_eq!(code, 1);
-    assert!(out.contains("conflict: f.txt") && out.contains("worktree and branch kept"), "{out}");
+    assert!(
+        out.contains("conflict: f.txt") && out.contains("worktree and branch kept"),
+        "{out}"
+    );
     assert!(w.exists() && branches(&d).contains("agent-c"));
     assert!(d.join(".git/MERGE_HEAD").exists());
 }

@@ -44,10 +44,13 @@ pub fn resolve(wts: &[Worktree], arg: &str) -> Result<Worktree, String> {
         .find(|(_, w)| w.branch.as_deref() == Some(arg) || same_path(&w.path, arg));
     match found {
         None => Err(format!("no worktree found for '{arg}'")),
-        Some((0, _)) => Err(format!("'{arg}' is the main worktree, not an agent worktree")),
-        Some((_, w)) if w.branch.is_none() => {
-            Err(format!("worktree {} has a detached HEAD, no branch to merge", w.path))
-        }
+        Some((0, _)) => Err(format!(
+            "'{arg}' is the main worktree, not an agent worktree"
+        )),
+        Some((_, w)) if w.branch.is_none() => Err(format!(
+            "worktree {} has a detached HEAD, no branch to merge",
+            w.path
+        )),
         Some((_, w)) => Ok(w.clone()),
     }
 }
@@ -108,10 +111,7 @@ pub fn run(arg: &str, verify: Option<&str>, transcript: Option<&str>) -> i32 {
     .unwrap_or_default();
     let dirty = real_dirty(&status, &cfg.worktree_junk);
     if !dirty.is_empty() {
-        let mut msg = format!(
-            "worktree {} has uncommitted or untracked files:",
-            wt.path
-        );
+        let mut msg = format!("worktree {} has uncommitted or untracked files:", wt.path);
         for d in dirty.iter().take(10) {
             msg += &format!("\n  {d}");
         }
@@ -147,23 +147,36 @@ pub fn run(arg: &str, verify: Option<&str>, transcript: Option<&str>) -> i32 {
         for f in conflicts.lines() {
             println!("conflict: {f}");
         }
-        for l in out
-            .lines()
-            .filter(|l| l.contains("CONFLICT") || l.starts_with("error:") || l.starts_with("fatal:"))
-        {
+        for l in out.lines().filter(|l| {
+            l.contains("CONFLICT") || l.starts_with("error:") || l.starts_with("fatal:")
+        }) {
             println!("{l}");
         }
-        println!("brood merge: merge failed; resolve or `git merge --abort`; worktree and branch kept");
+        println!(
+            "brood merge: merge failed; resolve or `git merge --abort`; worktree and branch kept"
+        );
         return 1;
     }
 
     // Verify.
     let mut verified = "skipped";
     if let Some(cmd) = verify {
-        let log = git(&cwd, &["rev-parse", "--path-format=absolute", "--git-path", "brood-verify.log"])
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-            .unwrap_or_default();
-        let log = if log.is_empty() { ".git/brood-verify.log".into() } else { log };
+        let log = git(
+            &cwd,
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "brood-verify.log",
+            ],
+        )
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .unwrap_or_default();
+        let log = if log.is_empty() {
+            ".git/brood-verify.log".into()
+        } else {
+            log
+        };
         let ok = (|| -> std::io::Result<bool> {
             let f = std::fs::File::create(&log)?;
             let st = Command::new("sh")
@@ -222,9 +235,15 @@ mod tests {
         let w = parse_worktrees(PORCELAIN);
         assert_eq!(w.len(), 3);
         assert_eq!(w[1].branch.as_deref(), Some("worktree-agent-1"));
-        assert_eq!(resolve(&w, "worktree-agent-1").unwrap().path, "/r/.claude/worktrees/agent-1");
         assert_eq!(
-            resolve(&w, "/r/.claude/worktrees/agent-1/").unwrap().branch.as_deref(),
+            resolve(&w, "worktree-agent-1").unwrap().path,
+            "/r/.claude/worktrees/agent-1"
+        );
+        assert_eq!(
+            resolve(&w, "/r/.claude/worktrees/agent-1/")
+                .unwrap()
+                .branch
+                .as_deref(),
             Some("worktree-agent-1")
         );
         assert!(resolve(&w, "main").unwrap_err().contains("main worktree"));

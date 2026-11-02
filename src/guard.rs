@@ -278,8 +278,9 @@ pub fn brood_merges(cmd: &str) -> Vec<String> {
 /// budget and never a build or test, even though `--verify` runs tests inside it.
 pub fn brood_merge_only(cmd: &str) -> bool {
     let cmds = simple_commands(cmd);
-    let is_bm =
-        |w: &Vec<String>| exe_name(&w[0]) == "brood" && w.get(1).map(String::as_str) == Some("merge");
+    let is_bm = |w: &Vec<String>| {
+        exe_name(&w[0]) == "brood" && w.get(1).map(String::as_str) == Some("merge")
+    };
     cmds.iter().any(is_bm) && cmds.iter().all(|w| is_bm(w) || git_args(w).is_some())
 }
 
@@ -346,11 +347,7 @@ pub fn is_build(cmd: &str) -> bool {
             | "xcodebuild" => true,
             e if e.starts_with("godot") || e.starts_with("unity") => true,
             // Project scripts like tools/run_replays.sh, build.sh, run_tests.ps1.
-            e if e.contains('.')
-                && (e.contains("replay") || e.contains("build")) =>
-            {
-                true
-            }
+            e if e.contains('.') && (e.contains("replay") || e.contains("build")) => true,
             _ => false,
         }
     })
