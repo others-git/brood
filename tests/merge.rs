@@ -22,6 +22,9 @@ fn repo(name: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     git(&d, &["init", "-q", "-b", "main"]);
+    // brood's own git calls need an identity on CI machines with no global config.
+    git(&d, &["config", "user.name", "t"]);
+    git(&d, &["config", "user.email", "t@t"]);
     std::fs::write(d.join("f.txt"), "base\n").unwrap();
     git(&d, &["add", "."]);
     git(&d, &["commit", "-qm", "base"]);
