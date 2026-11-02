@@ -708,7 +708,7 @@ fn route(sh: &Arc<Shared>, req: &Req, body: &Value) -> (u16, Value) {
             let Some(title) = s(body, "title") else {
                 return err(400, "title required");
             };
-            let mut g = sh.inner.lock().unwrap();
+            let g = sh.inner.lock().unwrap();
             let mut r = store::create(
                 &root,
                 cols,
