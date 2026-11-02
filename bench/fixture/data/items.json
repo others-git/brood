@@ -1,0 +1,8 @@
+[
+  {"sku": "A100", "name": "Widget", "price_cents": 250, "qty": 40, "category": "parts"},
+  {"sku": "A200", "name": "Gadget", "price_cents": 1299, "qty": 3, "category": "parts"},
+  {"sku": "B100", "name": "Notebook", "price_cents": 475, "qty": 12, "category": "office"},
+  {"sku": "B200", "name": "Pen box", "price_cents": 899, "qty": 2, "category": "office"},
+  {"sku": "C100", "name": "Cable", "price_cents": 1500, "qty": 25, "category": "parts"},
+  {"sku": "C200", "name": "Lamp", "price_cents": 3200, "qty": 0, "category": "home"}
+]

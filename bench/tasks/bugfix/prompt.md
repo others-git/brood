@@ -1,0 +1,1 @@
+Customers are complaining that discount codes sometimes don't work on invoices. One said they typed "save10" and paid full price, another said a code with a stray space at the start still failed. Find the cause and fix it, and add a regression test.

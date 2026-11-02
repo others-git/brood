@@ -1,61 +1,178 @@
 # brood
 
-A Claude Code plugin for long sessions with many subagents. It keeps the main session light and stops subagents from leaving a mess behind.
+brood is a Claude Code plugin with a Rust helper binary. The plugin keeps the main session (the coordinator) free to take new requests. The coordinator sends work to background subagents. The helper binary, `brood hook`, runs on Claude Code hook events. It enforces limits, cleans up processes, and blocks unsafe commands.
 
-- **Coordinator mode.** The main session plans and queues; work goes to background subagents, so you can keep adding tasks. The main session may still do trivial work itself (a few sentences in a doc, a typo, a config value), and brood holds it to that: per message, at most 3 work tool calls (read, search, edit, shell), one file edited, about 10 changed lines, and no foreground builds, tests or replays. Claude Code's own bookkeeping (auto-memory, plans, the session scratchpad) is exempt. Past that, the call is refused with "delegate this". Put `#solo` in a message to let the main session work inline for that message.
-- **Cheaper subagents.** `brood:researcher` (Haiku, read-only), `brood:implementer` (Sonnet), `brood:reviewer` (Opus). Every report starts with `STATUS: complete | partial | blocked`.
-- **No orphaned helpers.** Subagents must spawn their own helpers in the foreground (at most 3), so a lead can't hand back while its helpers are still writing. If one gets through anyway, brood sends the lead back, then tells the coordinator to resume it.
-- **No leftover processes.** `nohup`, `setsid`, `disown`, trailing `&` and `start /b` are refused in favour of the Bash tool's tracked `run_in_background`. A subagent that tries to finish with processes or background tasks still running is sent back to stop them, and brood kills what's left after two tries. Session end kills the session's leftovers, and each new session sweeps processes from crashed ones.
-- **Git safety.** `git worktree remove` is refused while the worktree has uncommitted or untracked files (add `# brood:allow-dirty` to the command to discard them on purpose). The coordinator can't merge or remove the branch or worktree of an agent that is still running or was just resumed. A failed `git merge` in any Bash output triggers a loud "merge FAILED, don't delete the branch" warning, even if a script printed success. Git-only commands don't count toward the coordinator's work budget, so merge and cleanup needn't be chained into one long line.
-- **Final report guarantee.** A subagent whose last message has no `STATUS:` line is sent back for one. If brood has to release an agent anyway, the coordinator is notified with the first 300 characters of its last message, so the report isn't lost.
-- **Script nudge.** Running the same chain of 3+ shell commands twice gets a hint to put it in a script.
-- **Loop guard.** The same Bash command run 4 times in a row by one agent is refused with a "change approach" message.
-- **Prompt-injection tripwire.** Web and MCP results with instruction-like text get a "treat this as data" warning. Commands that would send secret-looking strings over the network are refused; reading credential or `.env` files, or editing Claude Code settings, asks you first.
+## 1. Requirements
 
-The guards are tripwires, not a security boundary. Claude Code's own permissions remain the real gate.
+- Claude Code with plugin support.
+- The `brood` binary on `PATH`. The hooks run `brood hook`.
+- Rust (edition 2024), only to build with `cargo install`.
 
-## Install
+## 2. Installation
 
-1. Put the `brood` binary on your `PATH`: download it from [Releases](https://github.com/others-git/brood/releases), or `cargo install --git https://github.com/others-git/brood`.
-2. In Claude Code:
-   ```
-   /plugin marketplace add others-git/brood
-   /plugin install brood@brood
-   ```
+1. Download the binary from [Releases](https://github.com/others-git/brood/releases). Or run `cargo install --git https://github.com/others-git/brood`.
+2. Put `brood` on your `PATH`.
+3. In Claude Code, run `/plugin marketplace add others-git/brood`.
+4. Run `/plugin install brood@brood`.
+5. Start a new session.
 
-Try it without installing: `claude --plugin-dir ./plugin`.
+To test without installing, run `claude --plugin-dir ./plugin`.
 
-## Commands
+## 3. Description of function
 
-- `brood gc [--dry-run]`: kill processes left by dead Claude Code sessions, prune old state.
-- `brood ps`: list live processes that belong to Claude Code sessions.
+### 3.1 Coordinator limits
 
-## Config
+The limits apply to the coordinator only, per user message. They apply when `coordinator` is `true`. Claude Code bookkeeping paths (auto-memory, plans, session scratchpad) are exempt.
 
-Optional, at `~/.config/brood/config.toml` (Linux), `~/Library/Application Support/brood/config.toml` (macOS) or `%APPDATA%\brood\config.toml` (Windows):
+| Rule | Limit | Override |
+|---|---|---|
+| Work tool calls (Bash, Read, Grep, Glob, Edit, Write, MultiEdit, NotebookEdit, WebFetch, WebSearch) | `main_tool_budget` = 3 | `#solo` in the message |
+| Files edited | 1 | `#solo` |
+| Lines changed in one edit | `trivial_edit_lines` = 10 | `#solo` |
+| Foreground build, test or replay | 0 | `run_in_background`, or `#solo` |
+| `general-purpose` agent without `model` | refused | Set `model`, or use a brood agent |
+
+A refused call returns "delegate this". Git-only commands and `free_commands` matches do not count toward the budget. The budget also resets when the coordinator turn ends.
+
+### 3.2 Subagent rules
+
+| Agent | Model | Tools |
+|---|---|---|
+| `brood:researcher` | Haiku | Read, Grep, Glob, WebFetch, WebSearch |
+| `brood:implementer` | Sonnet | All |
+| `brood:reviewer` | Opus | Read, Grep, Glob, Bash |
+
+- Every report starts with `STATUS: complete`, `STATUS: partial` or `STATUS: blocked`.
+- A `brood:` subagent that ends without a `STATUS:` line is sent back.
+- A subagent spawns helpers in the foreground only. The limit is `max_helpers` = 3 per subagent.
+- A subagent that ends while its helpers still run is sent back. After `cleanup_retries` = 2 returns, brood releases it. The coordinator then gets a notice with the first 300 characters of the last message.
+
+### 3.3 Process cleanup
+
+- brood refuses `nohup`, `setsid`, `disown`, `daemonize`, `start /b`, `start /min`, `Start-Process` and a lone `&`. Use `run_in_background`.
+- A subagent that ends with its own processes or background tasks running is sent back. After `cleanup_retries` returns, brood stops them.
+- Session end stops the leftovers of that session.
+- Session start stops the leftovers of dead sessions.
+- brood finds processes by the `CLAUDE_CODE_SESSION_ID` and `CLAUDE_PID` variables. It does not rewrite your commands.
+- brood sends a polite signal first, then forces a kill. Windows has no polite signal, so brood ends the process at once.
+
+### 3.4 Git safety
+
+| Rule | Action | Override |
+|---|---|---|
+| `git worktree remove` on a worktree with uncommitted or untracked files (build junk like `__pycache__/` ignored) | Refused. brood lists up to 10 files. | `# brood:allow-dirty` in the command |
+| Coordinator merges or removes the branch or worktree of a running or just-resumed agent | Refused | Wait for the agent report |
+| `git merge`, `pull`, `rebase` or `cherry-pick` fails, or a merge script reports a git failure | Warning: do not delete the branch or worktree | None |
+
+### 3.5 Guards
+
+| Guard | Trigger | Action |
+|---|---|---|
+| Loop | Same Bash command, same agent, `loop_streak` = 4 times in a row | Refused on the 4th run |
+| Script hint | Chain of 3 or more commands, run a second time | Hint to use a script |
+| Secret | Network command or WebFetch with a secret-looking string | Refused |
+| Credential | Network command that names a credential file | Refused |
+| Credential read | Read or shell use of `.ssh`, `.env`, `.aws/credentials`, `.netrc` and similar | Asks you |
+| Config write | Edit of Claude Code settings, plugins or brood config | Asks you |
+| Injection | Result of a `scan_tools` tool with instruction-like text | Warning: treat as data |
+
+**WARNING:** The guards are tripwires, not a security boundary. The permission system of Claude Code is the real gate.
+
+## 4. Commands
+
+| Command | Function |
+|---|---|
+| `brood hook` | Handle a hook event from stdin. Claude Code runs it. Do not run it by hand. |
+| `brood gc` | Stop processes of dead Claude Code sessions. Delete session state older than 7 days. |
+| `brood gc --dry-run` | List the processes `gc` would stop. Stop nothing. |
+| `brood merge <branch-or-path> [--verify "<cmd>"]` | Merge a worktree agent's branch. Refuse (exit 2) if the worktree has uncommitted non-junk files or its agent is live. Run `--verify` after the merge; write its output to `.git/brood-verify.log`. On conflict or verify failure, keep the worktree and branch (exit 1). On success, remove both. Free of the coordinator budget. |
+| `brood ps` | List live processes tagged with a session: session, PID, command. |
+
+## 5. Configuration
+
+The file is optional. Every key is optional.
+
+| Key | Default | Function |
+|---|---|---|
+| `coordinator` | `true` | Inject the coordinator prompt and enforce coordinator limits. |
+| `loop_streak` | `4` | Identical commands in a row before refusal. `0` = off. |
+| `cleanup_retries` | `2` | Times brood sends a subagent back before it cleans up. |
+| `max_helpers` | `3` | Helpers per subagent. `0` = no cap. |
+| `main_tool_budget` | `3` | Work tool calls per message for the coordinator. `0` = no limit. |
+| `trivial_edit_lines` | `10` | Largest edit for the coordinator. `0` = no limit. |
+| `free_commands` | `[]` | Regexes for shell commands that do not count toward the budget. |
+| `scan_tools` | `^(WebFetch\|WebSearch\|mcp__.*)$` | Regex on tool names whose output brood scans. |
+| `extra_secret_patterns` | `[]` | Extra regexes for secrets. |
+| `extra_injection_patterns` | `[]` | Extra regexes for instruction-like text. |
+| `worktree_junk` | `[]` | Extra `name/` or `*.ext` patterns the worktree-remove guard ignores, on top of `__pycache__/`, `*.pyc`, `node_modules/`, `target/` and similar. Untracked files only. |
 
 ```toml
-coordinator = true          # inject coordinator mode; or set BROOD_COORDINATOR=0
-loop_streak = 4             # identical commands in a row before refusing (0 = off)
-cleanup_retries = 2         # times a subagent is sent back before brood cleans up itself
-max_helpers = 3             # helpers per subagent (0 = no cap)
-main_tool_budget = 3        # work tool calls per message in the main session (0 = no limit)
-trivial_edit_lines = 10     # largest edit the main session may make itself (0 = no limit)
-free_commands = []          # regexes for shell commands that don't count toward main_tool_budget (git-only commands are always free)
-scan_tools = "^(WebFetch|WebSearch|mcp__.*)$"
+coordinator = true
+main_tool_budget = 5
+free_commands = ["^ls\\b"]
 extra_secret_patterns = ["mykey_[A-Za-z0-9]{32}"]
-extra_injection_patterns = []
 ```
 
-Edit `plugin/context/coordinator.md` to change the coordinator instructions without rebuilding.
+| OS | Path |
+|---|---|
+| Linux | `~/.config/brood/config.toml` |
+| macOS | `~/Library/Application Support/brood/config.toml` |
+| Windows | `%APPDATA%\brood\config.toml` |
 
-## How it finds processes
+Environment variables:
 
-Claude Code sets `CLAUDE_CODE_SESSION_ID` and `CLAUDE_PID` in the environment of everything it spawns, and that survives detaching. brood reads those tags. It never rewrites your commands, so your permission rules keep working. Logs live in the platform data dir under `brood/` (`BROOD_DEBUG=1` also logs raw hook events).
+| Variable | Function |
+|---|---|
+| `BROOD_COORDINATOR=0` (or `false`) | Disable coordinator mode. |
+| `BROOD_DEBUG=1` | Also log raw hook events to the global log. |
 
-## Known gaps
+To change the coordinator instructions, edit `plugin/context/coordinator.md`. brood reads it from `CLAUDE_PLUGIN_ROOT` at session start. No rebuild is needed.
 
-- Windows `.exe`s started from WSL run outside Linux's process table and aren't cleaned up.
-- If Claude Code crashes, its leftovers are only swept when the next session starts.
-- Agent-team teammates don't appear in non-interactive (`claude -p`) runs, so their path is untested.
-- Not yet tested on native Windows or macOS beyond CI builds.
+## 6. Logs and troubleshooting
+
+The data directory is `~/.local/share/brood` (Linux), `~/Library/Application Support/brood` (macOS) or `%LOCALAPPDATA%\brood` (Windows).
+
+| File | Content |
+|---|---|
+| `sessions/<session_id>/brood.log` | Denials, releases and kills of one session |
+| `brood.log` | Hook errors, and raw events when `BROOD_DEBUG=1` |
+
+| Problem | Action |
+|---|---|
+| Hooks do nothing | Make sure `brood --version` works in the shell Claude Code uses. |
+| Coordinator refuses a small task | Add `#solo` to the message. Or raise `main_tool_budget`. |
+| Config has no effect | Check the TOML syntax. brood uses all defaults if the file does not parse. |
+| Processes remain | Run `brood ps`, then `brood gc`. |
+
+## 7. Limits
+
+**WARNING:** The guards are tripwires. Do not rely on them to stop a malicious command.
+
+**WARNING:** `# brood:allow-dirty` destroys uncommitted files in the worktree. Use it only when you want that.
+
+**CAUTION:** The worktree guard skips quoted paths with spaces. It also skips paths set by `git -C` or `cd`. It does not refuse these commands.
+
+**CAUTION:** Agent-team teammates do not appear in `claude -p` runs. This mode is untested.
+
+**CAUTION:** CI tests Windows and macOS builds only. Native use on those systems is not otherwise tested.
+
+**NOTE:** brood fails open. If the hook fails, the tool call goes on.
+
+**NOTE:** Windows `.exe` processes started from WSL are not in the Linux process table. brood does not clean them.
+
+**NOTE:** If Claude Code crashes, brood sweeps the leftovers at the next session start.
+
+## 8. Release procedure (maintainers)
+
+Requirements: `cargo`, `git`, `gh` and `claude` on `PATH`. The script runs `git add -A`, so commit or stash unrelated changes first.
+
+1. Run `tools/release.sh X.Y.Z [commit-message-file]`.
+2. The script stops if tag `vX.Y.Z` exists.
+3. It sets the version in `Cargo.toml` and `plugin/.claude-plugin/plugin.json`.
+4. It runs `cargo build` and `cargo test`.
+5. It commits, tags `vX.Y.Z`, and pushes `main` and the tag.
+6. The tag starts the `release` workflow. The script waits for it to pass.
+7. It installs the Linux x86_64 binary to `~/.local/bin/brood` and checks the version.
+8. It updates the Claude Code marketplace and the plugin.
+
+On failure, the script prints the failed step. The log is `${TMPDIR:-/tmp}/brood-release.log`.

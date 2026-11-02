@@ -1,6 +1,6 @@
 {
   "name": "brood",
-  "version": "0.0.7",
+  "version": "0.0.8",
   "description": "Coordinator mode, subagent model hints, process cleanup, and loop and prompt-injection guards. Needs the `brood` binary on PATH.",
   "author": { "name": "others-git" },
   "repository": "https://github.com/others-git/brood",

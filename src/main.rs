@@ -6,6 +6,7 @@
 mod config;
 mod guard;
 mod hook;
+mod merge;
 mod procs;
 mod state;
 
@@ -30,6 +31,17 @@ enum Cmd {
     },
     /// Show live processes that belong to Claude Code sessions.
     Ps,
+    /// Merge a worktree agent's branch, optionally verify, then remove its worktree and branch.
+    Merge {
+        /// Branch name or worktree path.
+        target: String,
+        /// Shell command to run after the merge; cleanup happens only if it passes.
+        #[arg(long)]
+        verify: Option<String>,
+        /// Session transcript path, for the live-agent check (default: env BROOD_TRANSCRIPT).
+        #[arg(long, hide = true)]
+        transcript: Option<String>,
+    },
 }
 
 fn main() {
@@ -51,6 +63,14 @@ fn main() {
                 state::prune_old_sessions();
             }
             println!("{} process(es)", killed.len());
+        }
+        Cmd::Merge {
+            target,
+            verify,
+            transcript,
+        } => {
+            let t = transcript.or_else(|| std::env::var("BROOD_TRANSCRIPT").ok());
+            std::process::exit(merge::run(&target, verify.as_deref(), t.as_deref()));
         }
         Cmd::Ps => {
             for p in procs::all_session_procs() {

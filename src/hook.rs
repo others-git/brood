@@ -136,7 +136,9 @@ fn pre_tool(cfg: &config::Config, ev: &Value, session: &str, agent: &str) -> Opt
                     "{why}, so it outlives the agent and gets lost. Use the Bash tool's run_in_background option instead, and stop it when you're done."
                 ));
             }
-            if let Some(r) = worktree_guard(cmd, ev["cwd"].as_str().unwrap_or(".")) {
+            if let Some(r) =
+                worktree_guard(cmd, ev["cwd"].as_str().unwrap_or("."), &cfg.worktree_junk)
+            {
                 return deny(r);
             }
             if agent == COORDINATOR
@@ -303,13 +305,14 @@ fn dirty_entries(path: &std::path::Path) -> Vec<String> {
 /// Deliberately lenient: a quoted path containing spaces, or a base set by
 /// `git -C` or `cd`, isn't resolved, so those are skipped (it never wrongly
 /// refuses). Refuse `git worktree remove` of a worktree that still has uncommitted work.
-fn worktree_guard(cmd: &str, cwd: &str) -> Option<String> {
+fn worktree_guard(cmd: &str, cwd: &str, junk: &[String]) -> Option<String> {
     if cmd.contains(guard::ALLOW_DIRTY) {
         return None;
     }
     for p in guard::worktree_removals(cmd) {
         let path = std::path::Path::new(cwd).join(&p);
-        let dirty = dirty_entries(&path);
+        let mut dirty = dirty_entries(&path);
+        dirty.retain(|l| !guard::is_junk(l, junk));
         if dirty.is_empty() {
             continue;
         }
@@ -355,6 +358,18 @@ fn live_agent_hit(dir: &std::path::Path, cmd: &str, now: std::time::SystemTime) 
     if cmds.is_empty() {
         return None;
     }
+    live_agent_where(dir, now, |id, branch, _| {
+        cmds.iter().flatten().any(|w| w == branch || w.contains(id))
+    })
+}
+
+/// The id of a live agent (see `live_agent_hit`) whose `(id, worktreeBranch,
+/// worktreePath)` satisfies `hit`.
+fn live_agent_where(
+    dir: &std::path::Path,
+    now: std::time::SystemTime,
+    hit: impl Fn(&str, &str, &str) -> bool,
+) -> Option<String> {
     for e in std::fs::read_dir(dir).ok()?.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
         let Some(id) = name
@@ -372,6 +387,7 @@ fn live_agent_hit(dir: &std::path::Path, cmd: &str, now: std::time::SystemTime) 
         let Some(branch) = meta["worktreeBranch"].as_str().filter(|b| !b.is_empty()) else {
             continue;
         };
+        let wpath = meta["worktreePath"].as_str().unwrap_or_default();
         let mtime = |p: std::path::PathBuf| std::fs::metadata(p).and_then(|m| m.modified()).ok();
         let Some(transcript) = mtime(dir.join(format!("agent-{id}.jsonl"))) else {
             continue;
@@ -384,19 +400,33 @@ fn live_agent_hit(dir: &std::path::Path, cmd: &str, now: std::time::SystemTime) 
         } else {
             recent
         };
-        if live && cmds.iter().flatten().any(|w| w == branch || w.contains(id)) {
+        if live && hit(id, branch, wpath) {
             return Some(id.to_owned());
         }
     }
     None
 }
 
-fn live_agent_guard(transcript: Option<&str>, cmd: &str) -> Option<String> {
-    let id = live_agent_hit(
-        &subagents_dir(transcript?),
-        cmd,
+/// Live agent owning the given worktree branch or path, for `brood merge`.
+pub fn live_agent_for_worktree(transcript: &str, branch: &str, path: &str) -> Option<String> {
+    live_agent_where(
+        &subagents_dir(transcript),
         std::time::SystemTime::now(),
-    )?;
+        |_, b, p| b == branch || (!p.is_empty() && p.trim_end_matches('/') == path.trim_end_matches('/')),
+    )
+}
+
+fn live_agent_guard(transcript: Option<&str>, cmd: &str) -> Option<String> {
+    let dir = subagents_dir(transcript?);
+    let now = std::time::SystemTime::now();
+    let targets = guard::brood_merges(cmd);
+    let id = live_agent_hit(&dir, cmd, now).or_else(|| {
+        live_agent_where(&dir, now, |id, b, p| {
+            targets
+                .iter()
+                .any(|t| t == b || t.contains(id) || (!p.is_empty() && t.trim_end_matches('/') == p))
+        })
+    })?;
     Some(format!(
         "agent {id} is still running (or was just resumed); wait for its final report before merging or removing its branch/worktree."
     ))
@@ -603,6 +633,9 @@ fn coordinator_check(cfg: &config::Config, ev: &Value, session: &str) -> Option<
         .or(input["notebook_path"].as_str())
         .unwrap_or_default();
     if guard::bookkeeping_path(path) {
+        return None;
+    }
+    if tool == "Bash" && guard::brood_merge_only(input["command"].as_str().unwrap_or_default()) {
         return None;
     }
     let mut st = state::load_agent(session, COORDINATOR);
@@ -931,15 +964,61 @@ mod tests {
         let cwd = dir.parent().unwrap().to_str().unwrap();
         let rel = dir.file_name().unwrap().to_str().unwrap();
         let cmd = format!("git worktree remove --force {rel}");
-        assert!(worktree_guard(&cmd, cwd).is_none());
+        assert!(worktree_guard(&cmd, cwd, &[]).is_none());
         std::fs::create_dir_all(dir.join("FOR_REVIEW")).unwrap();
         std::fs::write(dir.join("FOR_REVIEW/shot.png"), "x").unwrap();
-        let why = worktree_guard(&cmd, cwd).unwrap();
+        let why = worktree_guard(&cmd, cwd, &[]).unwrap();
         assert!(why.contains("FOR_REVIEW/shot.png"));
-        assert!(worktree_guard(&format!("{cmd} # brood:allow-dirty"), cwd).is_none());
+        assert!(worktree_guard(&format!("{cmd} # brood:allow-dirty"), cwd, &[]).is_none());
         // Missing path: don't block.
-        assert!(worktree_guard("git worktree remove /nonexistent/zzz", cwd).is_none());
+        assert!(worktree_guard("git worktree remove /nonexistent/zzz", cwd, &[]).is_none());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn junk_only_worktree_is_removable() {
+        let dir = scratch("junk");
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(["-C", dir.to_str().unwrap()])
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        let cwd = dir.parent().unwrap().to_str().unwrap();
+        let rel = dir.file_name().unwrap().to_str().unwrap();
+        let cmd = format!("git worktree remove --force {rel}");
+        std::fs::create_dir_all(dir.join("a/b/__pycache__")).unwrap();
+        std::fs::write(dir.join("a/b/__pycache__/x.pyc"), "x").unwrap();
+        std::fs::write(dir.join("scratch.tmp"), "x").unwrap();
+        assert!(worktree_guard(&cmd, cwd, &[]).is_none());
+        std::fs::write(dir.join("real.rs"), "x").unwrap();
+        let why = worktree_guard(&cmd, cwd, &[]).unwrap();
+        assert!(why.contains("real.rs"));
+        assert!(!why.contains("pyc") && !why.contains("scratch.tmp"));
+        std::fs::remove_file(dir.join("real.rs")).unwrap();
+        std::fs::write(dir.join("out.bin"), "x").unwrap();
+        assert!(worktree_guard(&cmd, cwd, &[]).is_some());
+        assert!(worktree_guard(&cmd, cwd, &["*.bin".to_string()]).is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn brood_merge_skips_budget_and_build_class() {
+        let cfg = config::Config::default();
+        let session = format!("brood-test-bmerge-{}", std::process::id());
+        let ev = |c: &str| json!({"tool_name": "Bash", "tool_input": {"command": c}});
+        for _ in 0..6 {
+            assert!(
+                coordinator_check(&cfg, &ev("brood merge br --verify \"cargo test\""), &session)
+                    .is_none()
+            );
+        }
+        assert!(coordinator_check(&cfg, &ev("cargo test"), &session).is_some());
     }
 
     #[test]

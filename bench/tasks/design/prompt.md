@@ -1,0 +1,1 @@
+Write a short design proposal for adding bulk CSV import to shelf (load many items from a CSV file, with validation and a dry-run mode). Put it in docs/ following the convention in docs/style.md. Cover the approach, which existing modules change, error handling, and alternatives you rejected. Don't implement it.

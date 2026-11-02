@@ -1,0 +1,1 @@
+Start the shelf HTTP server from the project on port 8765, request its /summary endpoint, save the JSON response to out/summary.json, and tell me the total value in dollars. Leave nothing running when you're done.

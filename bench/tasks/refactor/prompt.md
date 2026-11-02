@@ -1,0 +1,1 @@
+Rename the core concept `Item` to `Product` across the whole shelf project: the class in shelf/models.py, every import and use in the package, the tests, and the docs and README. Behaviour must not change (JSON data files keep their format and the file name items.json stays). Don't leave a compatibility alias. Keep the test suite passing.

@@ -27,6 +27,8 @@ pub struct Config {
     pub extra_secret_patterns: Vec<String>,
     /// Extra regexes for instruction-like text in fetched content.
     pub extra_injection_patterns: Vec<String>,
+    /// Extra junk patterns (`name/` or `*.ext`) the worktree-remove guard ignores for untracked files.
+    pub worktree_junk: Vec<String>,
 }
 
 impl Default for Config {
@@ -42,6 +44,7 @@ impl Default for Config {
             scan_tools: r"^(WebFetch|WebSearch|mcp__.*)$".into(),
             extra_secret_patterns: vec![],
             extra_injection_patterns: vec![],
+            worktree_junk: vec![],
         }
     }
 }

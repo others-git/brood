@@ -1,0 +1,1 @@
+Two independent changes please. (1) Add `Store.remove(sku)` that deletes an item (raise KeyError if unknown) and a CLI subcommand `remove SKU` that removes it and writes the data file back. (2) Make `utils.format_money` put thousands separators in the dollars part (1234567 cents -> "$12,345.67"). Add unit tests for both and keep the suite passing.

@@ -53,6 +53,52 @@ pub fn detached(cmd: &str) -> Option<&'static str> {
     None
 }
 
+/// Untracked build junk the worktree-remove guard ignores.
+pub const DEFAULT_JUNK: &[&str] = &[
+    "__pycache__/",
+    "*.pyc",
+    "*.pyo",
+    ".pytest_cache/",
+    ".mypy_cache/",
+    ".ruff_cache/",
+    "node_modules/",
+    "target/",
+    ".godot/",
+    ".import/",
+    "*.tmp",
+    ".DS_Store",
+    "Thumbs.db",
+];
+
+/// Whether a `git status --porcelain` line is an untracked entry (`??`)
+/// matching a junk pattern. Patterns: `name/` matches any directory component
+/// equal to `name`; `*.ext` matches a file suffix; anything else matches a
+/// file name exactly. Tracked changes are never junk.
+pub fn is_junk(line: &str, extra: &[String]) -> bool {
+    let Some(path) = line.strip_prefix("?? ") else {
+        return false;
+    };
+    let path = path.trim().trim_matches('"');
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    let Some((file, dirs)) = parts.split_last() else {
+        return false;
+    };
+    DEFAULT_JUNK
+        .iter()
+        .copied()
+        .chain(extra.iter().map(String::as_str))
+        .any(|pat| {
+            if let Some(name) = pat.strip_suffix('/') {
+                // A trailing-slash entry (untracked dir) is its own last component.
+                dirs.contains(&name) || (path.ends_with('/') && *file == name)
+            } else if let Some(suffix) = pat.strip_prefix('*') {
+                file.ends_with(suffix)
+            } else {
+                *file == pat
+            }
+        })
+}
+
 static NETWORK: LazyLock<Regex> = LazyLock::new(|| {
     re(
         r"\b(curl|wget|nc|ncat|netcat|socat|telnet|ssh|scp|sftp|rsync|ftp|Invoke-WebRequest|Invoke-RestMethod|iwr|irm)\b|https?://",
@@ -205,6 +251,36 @@ pub fn merge_commands(cmd: &str, sync: bool) -> Vec<Vec<String>> {
                 .any(|w| exe_name(w).contains("merge") && !w.starts_with('-'))
         })
         .collect()
+}
+
+/// Targets (branch or worktree path) of each `brood merge <target>` in `cmd`.
+pub fn brood_merges(cmd: &str) -> Vec<String> {
+    simple_commands(cmd)
+        .iter()
+        .filter(|w| exe_name(&w[0]) == "brood" && w.get(1).map(String::as_str) == Some("merge"))
+        .filter_map(|w| {
+            let mut it = w[2..].iter();
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--verify" => {
+                        it.next();
+                    }
+                    a if a.starts_with('-') => {}
+                    a => return Some(a.to_owned()),
+                }
+            }
+            None
+        })
+        .collect()
+}
+
+/// A command made only of `git ...` and at least one `brood merge ...`: free of
+/// budget and never a build or test, even though `--verify` runs tests inside it.
+pub fn brood_merge_only(cmd: &str) -> bool {
+    let cmds = simple_commands(cmd);
+    let is_bm =
+        |w: &Vec<String>| exe_name(&w[0]) == "brood" && w.get(1).map(String::as_str) == Some("merge");
+    cmds.iter().any(is_bm) && cmds.iter().all(|w| is_bm(w) || git_args(w).is_some())
 }
 
 /// Whether every simple command in `cmd` is `git ...` or matches one of `free`.
@@ -380,6 +456,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn junk_matching() {
+        let none: &[String] = &[];
+        assert!(is_junk("?? a/b/__pycache__/x.pyc", none));
+        assert!(is_junk("?? mod.pyc", none));
+        assert!(is_junk("?? target/debug/x", none));
+        assert!(is_junk("?? .DS_Store", none));
+        assert!(is_junk("?? __pycache__/", none));
+        assert!(!is_junk("?? src/main.rs", none));
+        assert!(!is_junk("?? targets/x.rs", none));
+        // Tracked changes always count, even under junk-looking paths.
+        assert!(!is_junk(" M target/notes.md", none));
+        assert!(!is_junk("M  a.pyc", none));
+        let extra = vec!["*.bin".to_string(), "out/".to_string()];
+        assert!(!is_junk("?? x.bin", none));
+        assert!(is_junk("?? x.bin", &extra));
+        assert!(is_junk("?? out/a.txt", &extra));
+    }
+
+    #[test]
     fn detach_patterns() {
         assert!(detached("nohup godot --headless").is_some());
         assert!(detached("npm run dev &").is_some());
@@ -537,6 +632,19 @@ mod tests {
         assert!(merge_failed("Merge with strategy ort failed."));
         assert!(!merge_failed("conflict ( lowercase is not git's wording"));
         assert!(!merge_failed("Merge made by the 'ort' strategy.\nmerged"));
+    }
+
+    #[test]
+    fn brood_merge_is_free() {
+        assert!(brood_merge_only("brood merge br --verify \"cargo test\""));
+        assert!(brood_merge_only("git status && brood merge br"));
+        assert!(!brood_merge_only("brood merge br && cargo test"));
+        assert!(!brood_merge_only("brood gc"));
+        assert!(!brood_merge_only("git status"));
+        assert!(!is_build_or_test("brood merge br --verify \"cargo test\""));
+        assert_eq!(brood_merges("brood merge --verify \"x\" br"), vec!["br"]);
+        // The merge-failure alarm keys on git merges only, so brood merge never double-warns.
+        assert!(merge_commands("brood merge br --verify \"cargo test\"", true).is_empty());
     }
 
     #[test]
