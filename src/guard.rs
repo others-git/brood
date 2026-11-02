@@ -304,10 +304,11 @@ pub fn merge_failed(text: &str) -> bool {
     MERGE_FAILED.is_match(text)
 }
 
-/// Builds, test runs, replays and other commands that take a while. Judged by
+/// Builds, replays, game runs and other commands that take a while (not
+/// tests or checks, which run inline). Judged by
 /// the program being run and its subcommand, never by words in arguments,
 /// heredocs or commit messages.
-pub fn is_build_or_test(cmd: &str) -> bool {
+pub fn is_build(cmd: &str) -> bool {
     simple_commands(cmd).iter().any(|words| {
         let exe = words[0]
             .rsplit(['/', '\\'])
@@ -320,34 +321,33 @@ pub fn is_build_or_test(cmd: &str) -> bool {
             .map(|w| w.to_ascii_lowercase())
             .unwrap_or_default();
         let sub = sub.as_str();
+        let noemit = words.iter().any(|w| w == "--noEmit");
         match exe {
-            "cargo" => matches!(
-                sub,
-                "build"
-                    | "b"
-                    | "test"
-                    | "t"
-                    | "run"
-                    | "r"
-                    | "check"
-                    | "c"
-                    | "clippy"
-                    | "nextest"
-                    | "bench"
-            ),
-            "dotnet" => matches!(sub, "build" | "test" | "run" | "publish"),
-            "npm" | "pnpm" | "yarn" | "bun" => matches!(
-                sub,
-                "run" | "test" | "t" | "build" | "install" | "i" | "ci" | "start"
-            ),
-            "npx" => matches!(sub, "jest" | "vitest" | "tsc" | "playwright"),
-            "go" => matches!(sub, "build" | "test" | "run"),
-            "msbuild" | "pytest" | "tox" | "make" | "cmake" | "ninja" | "gradle" | "gradlew"
-            | "mvn" | "xcodebuild" | "tsc" | "jest" | "vitest" => true,
+            // Tests and checks (cargo test/check/clippy/nextest, dotnet test,
+            // go test, npm test, pytest, jest, vitest, ...) are quick enough
+            // to run inline, so only builds and runs are matched here.
+            "cargo" => matches!(sub, "build" | "b" | "run" | "r" | "bench"),
+            "dotnet" => matches!(sub, "build" | "run" | "publish"),
+            "npm" | "pnpm" | "yarn" | "bun" => match sub {
+                "run" | "run-script" => {
+                    let script = words.get(2).map(|w| w.to_ascii_lowercase());
+                    let script = script.as_deref().unwrap_or_default();
+                    !["test", "lint", "check", "typecheck"]
+                        .iter()
+                        .any(|p| script.starts_with(p))
+                }
+                "build" | "install" | "i" | "ci" | "start" => true,
+                _ => false,
+            },
+            "npx" => matches!(sub, "playwright") || (sub == "tsc" && !noemit),
+            "go" => matches!(sub, "build" | "run"),
+            "tsc" => !noemit,
+            "msbuild" | "make" | "cmake" | "ninja" | "gradle" | "gradlew" | "mvn"
+            | "xcodebuild" => true,
             e if e.starts_with("godot") || e.starts_with("unity") => true,
             // Project scripts like tools/run_replays.sh, build.sh, run_tests.ps1.
             e if e.contains('.')
-                && (e.contains("replay") || e.contains("build") || e.contains("test")) =>
+                && (e.contains("replay") || e.contains("build")) =>
             {
                 true
             }
@@ -490,21 +490,36 @@ mod tests {
     #[test]
     fn builds_and_tests() {
         for c in [
-            "cargo test",
+            "cargo build --release",
             "dotnet build game.csproj",
+            "npm run build",
+            "cmake --build out",
+            "cargo test && cargo build",
             "npm run dev",
             "tools/run_replays.sh",
             "godot --headless -s x",
             "make -j8",
-            "pytest -q",
             "cd game && dotnet build",
             "GODOT=/opt/godot bash tools/run_replays.sh smoke",
             "timeout 600 Godot_v4.exe --headless",
-            r"'/mnt/c/Program Files/dotnet/dotnet.exe' test",
+            r"'/mnt/c/Program Files/dotnet/dotnet.exe' build",
         ] {
-            assert!(is_build_or_test(c), "{c}");
+            assert!(is_build(c), "{c}");
         }
         for c in [
+            "cargo test",
+            "cargo check",
+            "cargo clippy -- -D warnings",
+            "cargo nextest run",
+            "pytest -q",
+            "go test ./...",
+            "npm test",
+            "npm run test:unit",
+            "npx vitest run",
+            "jest",
+            "ctest",
+            "dotnet test",
+            "tools/run_tests.sh",
             "git status",
             "ls src",
             "cat Makefile.md",
@@ -513,7 +528,7 @@ mod tests {
             "git commit -m 'run the replays and test the build'",
             "cat >> docs/backlog.md <<'EOF'\n- replay unlocks via Intel\n- make the data test pass\nEOF\ngit add docs/backlog.md && git commit -q -m \"backlog\"",
         ] {
-            assert!(!is_build_or_test(c), "{c}");
+            assert!(!is_build(c), "{c}");
         }
     }
 
@@ -641,7 +656,7 @@ mod tests {
         assert!(!brood_merge_only("brood merge br && cargo test"));
         assert!(!brood_merge_only("brood gc"));
         assert!(!brood_merge_only("git status"));
-        assert!(!is_build_or_test("brood merge br --verify \"cargo test\""));
+        assert!(!is_build("brood merge br --verify \"cargo test\""));
         assert_eq!(brood_merges("brood merge --verify \"x\" br"), vec!["br"]);
         // The merge-failure alarm keys on git merges only, so brood merge never double-warns.
         assert!(merge_commands("brood merge br --verify \"cargo test\"", true).is_empty());

@@ -52,6 +52,11 @@ pub struct AgentState {
     pub solo: bool,
     /// Main session only: files edited since the user's last message.
     pub turn_files: Vec<String>,
+    /// Main session only: soft / firm nudge already queued this user message.
+    pub nudged_soft: bool,
+    pub nudged_firm: bool,
+    /// Main session only: nudge text waiting for the next PostToolUse.
+    pub pending_nudge: Option<String>,
 }
 
 pub fn load_agent(session: &str, agent: &str) -> AgentState {

@@ -230,6 +230,15 @@ fn post_tool(cfg: &config::Config, ev: &Value, session: &str, agent: &str) -> Op
     let mut text = String::new();
     collect_strings(&ev["tool_response"], &mut text);
     let mut parts = vec![];
+    if agent == COORDINATOR && cfg.coordinator {
+        let mut st = state::load_agent(session, COORDINATOR);
+        if !st.solo
+            && let Some(n) = st.pending_nudge.take()
+        {
+            state::save_agent(session, COORDINATOR, &st);
+            parts.push(n);
+        }
+    }
     let bash_cmd = ev["tool_input"]["command"].as_str().unwrap_or_default();
     if tool == "Bash"
         && !guard::merge_commands(bash_cmd, true).is_empty()
@@ -412,7 +421,9 @@ pub fn live_agent_for_worktree(transcript: &str, branch: &str, path: &str) -> Op
     live_agent_where(
         &subagents_dir(transcript),
         std::time::SystemTime::now(),
-        |_, b, p| b == branch || (!p.is_empty() && p.trim_end_matches('/') == path.trim_end_matches('/')),
+        |_, b, p| {
+            b == branch || (!p.is_empty() && p.trim_end_matches('/') == path.trim_end_matches('/'))
+        },
     )
 }
 
@@ -422,9 +433,9 @@ fn live_agent_guard(transcript: Option<&str>, cmd: &str) -> Option<String> {
     let targets = guard::brood_merges(cmd);
     let id = live_agent_hit(&dir, cmd, now).or_else(|| {
         live_agent_where(&dir, now, |id, b, p| {
-            targets
-                .iter()
-                .any(|t| t == b || t.contains(id) || (!p.is_empty() && t.trim_end_matches('/') == p))
+            targets.iter().any(|t| {
+                t == b || t.contains(id) || (!p.is_empty() && t.trim_end_matches('/') == p)
+            })
         })
     })?;
     Some(format!(
@@ -620,8 +631,8 @@ const WORK_TOOLS: &[&str] = &[
 
 const DELEGATE_HINT: &str = "Hand it to a background subagent (brood:implementer for edits, builds and tests; brood:researcher for lookups) and tell the user it's queued. If the user wants you to do it inline, they can add #solo to their message.";
 
-/// Keep the main session coordinating: no blocking builds or tests, and only a
-/// few work tool calls per user message.
+/// Keep the main session coordinating: deny blocking builds and tests; as work
+/// grows, queue a nudge (delivered by PostToolUse) instead of refusing.
 fn coordinator_check(cfg: &config::Config, ev: &Value, session: &str) -> Option<String> {
     let tool = ev["tool_name"].as_str().unwrap_or_default();
     if !WORK_TOOLS.contains(&tool) {
@@ -644,32 +655,19 @@ fn coordinator_check(cfg: &config::Config, ev: &Value, session: &str) -> Option<
     }
     if tool == "Bash"
         && input["run_in_background"].as_bool() != Some(true)
-        && guard::is_build_or_test(input["command"].as_str().unwrap_or_default())
+        && guard::is_build(input["command"].as_str().unwrap_or_default())
     {
         return Some(format!(
-            "brood:coordinator: builds, tests and replays block the main session. {DELEGATE_HINT}"
+            "brood:coordinator: builds and replays block the main session. {DELEGATE_HINT}"
         ));
     }
+    let mut big_edit = None;
     if let Some(lines) = edit_lines(tool, input) {
-        let path = input["file_path"]
-            .as_str()
-            .or(input["notebook_path"].as_str())
-            .unwrap_or_default()
-            .to_owned();
         if cfg.trivial_edit_lines > 0 && lines > cfg.trivial_edit_lines as usize {
-            return Some(format!(
-                "brood:coordinator: this edit changes {lines} lines, more than a trivial edit ({} max). {DELEGATE_HINT}",
-                cfg.trivial_edit_lines
-            ));
+            big_edit = Some(lines);
         }
-        if !st.turn_files.is_empty() && !st.turn_files.contains(&path) {
-            return Some(format!(
-                "brood:coordinator: trivial work touches one file, and this request already edited {}. {DELEGATE_HINT}",
-                st.turn_files[0]
-            ));
-        }
-        if !st.turn_files.contains(&path) {
-            st.turn_files.push(path);
+        if !st.turn_files.iter().any(|f| f == path) {
+            st.turn_files.push(path.to_owned());
         }
     }
     if tool == "Bash" {
@@ -679,17 +677,30 @@ fn coordinator_check(cfg: &config::Config, ev: &Value, session: &str) -> Option<
             .filter_map(|p| regex::Regex::new(p).ok())
             .collect();
         if guard::all_free(input["command"].as_str().unwrap_or_default(), &free) {
+            state::save_agent(session, COORDINATOR, &st);
             return None;
         }
     }
     st.turn_calls += 1;
-    state::save_agent(session, COORDINATOR, &st);
-    if cfg.main_tool_budget > 0 && st.turn_calls > cfg.main_tool_budget {
-        return Some(format!(
-            "brood:coordinator: this request has already used {} work tool calls in the main session, so it isn't trivial. {DELEGATE_HINT}",
-            st.turn_calls - 1
+    let (calls, files) = (st.turn_calls, st.turn_files.len() as u32);
+    let at = |limit: u32, n: u32| limit > 0 && n >= limit;
+    if cfg.firm_nudge_after > 0 && calls >= cfg.firm_nudge_after && !st.nudged_firm {
+        st.nudged_firm = true;
+        st.pending_nudge = Some(format!(
+            "brood: {calls} tool calls inline. Delegate the remainder now unless you are about to finish."
+        ));
+    } else if !st.nudged_soft
+        && (at(cfg.main_tool_budget, calls)
+            || at(3, files) && cfg.main_tool_budget > 0
+            || big_edit.is_some())
+    {
+        st.nudged_soft = true;
+        st.pending_nudge = Some(format!(
+            "brood: this request is growing ({calls} tool calls / {files} files{}). If more than a quick fix remains, delegate the rest to a subagent and stay free.",
+            big_edit.map_or(String::new(), |l| format!(", a {l}-line edit"))
         ));
     }
+    state::save_agent(session, COORDINATOR, &st);
     None
 }
 
@@ -713,12 +724,15 @@ fn edit_lines(tool: &str, input: &Value) -> Option<usize> {
     }
 }
 
-const TURN_REMINDER: &str = "You are brood:coordinator: you coordinate, subagents do the work. Do it yourself only if it's trivial: an answer from what you already know, a quick lookup, or one small edit to one file (a few sentences in a doc, a typo, a config value; about 10 lines or fewer) that needs no build or test to trust. Delegate everything else to background subagents and stay free for the next request.";
+const TURN_REMINDER: &str = "You are brood:coordinator. Quick fixes (a handful of tool calls, one or two files) you do yourself, tests and checks inline. If the request clearly needs more (new feature, multi-file work, refactor, any build), delegate at once without reading or searching first; the subagent explores, so brief it with the request and known paths. Explore inline only if unsure it is quick. Foreground builds are refused.";
 
 fn user_prompt(cfg: &config::Config, ev: &Value, session: &str) -> Option<Value> {
     let mut st = state::load_agent(session, COORDINATOR);
     st.turn_calls = 0;
     st.turn_files.clear();
+    st.nudged_soft = false;
+    st.nudged_firm = false;
+    st.pending_nudge = None;
     st.solo = ev["prompt"].as_str().is_some_and(|p| p.contains("#solo"));
     state::save_agent(session, COORDINATOR, &st);
 
@@ -747,6 +761,9 @@ fn main_stop(session: &str) -> Option<Value> {
     let mut st = state::load_agent(session, COORDINATOR);
     st.turn_calls = 0;
     st.turn_files.clear();
+    st.nudged_soft = false;
+    st.nudged_firm = false;
+    st.pending_nudge = None;
     st.solo = false;
     state::save_agent(session, COORDINATOR, &st);
     None
@@ -1014,11 +1031,15 @@ mod tests {
         let ev = |c: &str| json!({"tool_name": "Bash", "tool_input": {"command": c}});
         for _ in 0..6 {
             assert!(
-                coordinator_check(&cfg, &ev("brood merge br --verify \"cargo test\""), &session)
-                    .is_none()
+                coordinator_check(
+                    &cfg,
+                    &ev("brood merge br --verify \"cargo test\""),
+                    &session
+                )
+                .is_none()
             );
         }
-        assert!(coordinator_check(&cfg, &ev("cargo test"), &session).is_some());
+        assert!(coordinator_check(&cfg, &ev("cargo build"), &session).is_some());
     }
 
     #[test]
@@ -1034,6 +1055,79 @@ mod tests {
         assert_eq!(state::load_agent(&session, COORDINATOR).turn_calls, 0);
         assert!(coordinator_check(&cfg, &ev("ls"), &session).is_none());
         assert_eq!(state::load_agent(&session, COORDINATOR).turn_calls, 1);
+        let _ = std::fs::remove_dir_all(state::session_dir(&session));
+    }
+
+    #[test]
+    fn growth_nudges_not_denies() {
+        let cfg = config::Config::default();
+        let session = format!("brood-test-nudge-{}", std::process::id());
+        let edit = |f: &str, n: usize| json!({"tool_name": "Edit", "tool_input": {"file_path": f, "old_string": "a", "new_string": "x\n".repeat(n)}});
+        let post = || {
+            post_tool(
+                &cfg,
+                &json!({"tool_name": "Edit", "tool_response": ""}),
+                &session,
+                COORDINATOR,
+            )
+        };
+        let text = |v: Option<Value>| {
+            v.map(|v| {
+                v["hookSpecificOutput"]["additionalContext"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+        };
+        // 3 files: no deny; soft nudge on the 3rd call, once.
+        for f in ["/p/a.rs", "/p/b.rs"] {
+            assert!(coordinator_check(&cfg, &edit(f, 1), &session).is_none());
+            assert!(post().is_none());
+        }
+        assert!(coordinator_check(&cfg, &edit("/p/c.rs", 1), &session).is_none());
+        assert!(text(post()).unwrap().contains("growing"));
+        assert!(post().is_none());
+        // calls 4..7 quiet, 8th gives the firm nudge once.
+        for _ in 4..8 {
+            assert!(coordinator_check(&cfg, &edit("/p/a.rs", 1), &session).is_none());
+            assert!(post().is_none());
+        }
+        assert!(coordinator_check(&cfg, &edit("/p/a.rs", 1), &session).is_none());
+        assert!(text(post()).unwrap().contains("8 tool calls inline"));
+        assert!(coordinator_check(&cfg, &edit("/p/a.rs", 1), &session).is_none());
+        assert!(post().is_none());
+        // new message resets; a big edit nudges soft.
+        user_prompt(&cfg, &json!({"prompt": "go"}), &session);
+        assert!(coordinator_check(&cfg, &edit("/p/a.rs", 31), &session).is_none());
+        assert!(text(post()).unwrap().contains("31-line"));
+        // #solo silences everything.
+        user_prompt(&cfg, &json!({"prompt": "go #solo"}), &session);
+        for _ in 0..10 {
+            assert!(coordinator_check(&cfg, &edit("/p/a.rs", 50), &session).is_none());
+            assert!(post().is_none());
+        }
+        // zero disables thresholds; builds are still denied.
+        let off = config::Config {
+            main_tool_budget: 0,
+            firm_nudge_after: 0,
+            trivial_edit_lines: 0,
+            ..Default::default()
+        };
+        user_prompt(&off, &json!({"prompt": "go"}), &session);
+        for _ in 0..12 {
+            assert!(coordinator_check(&off, &edit("/p/a.rs", 99), &session).is_none());
+            assert!(
+                post_tool(
+                    &off,
+                    &json!({"tool_name": "Edit", "tool_response": ""}),
+                    &session,
+                    COORDINATOR
+                )
+                .is_none()
+            );
+        }
+        let build = json!({"tool_name": "Bash", "tool_input": {"command": "cargo build"}});
+        assert!(coordinator_check(&cfg, &build, &session).is_some());
         let _ = std::fs::remove_dir_all(state::session_dir(&session));
     }
 

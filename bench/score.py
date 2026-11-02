@@ -101,7 +101,7 @@ def token_stats(session):
         agents.append({"type": meta.get("agentType", "?"), "model": model,
                        "id": os.path.basename(p)[:-6]})
     return {"main_transcript": main, "unfinished_agents": sum(unfinished(p) for p in subs),
-            "failed_merges": failed_merges([main] + subs), "brood_merge_calls": count_cmd(main, "brood merge"), "main_messages": len(main_msgs),
+            "failed_merges": failed_merges([main] + subs), "brood_merge_calls": count_cmd(main, "brood merge"), "nudges": count_nudges([main]), "main_messages": len(main_msgs),
             "tokens": {k: dict(v) for k, v in tokens.items()},
             "tokens_by_role": {k: dict(v) for k, v in roles.items()},
             "main_peak_context": peak, "agents": agents}
@@ -140,6 +140,21 @@ def count_cmd(path, needle):
             for b in c:
                 if b.get("type") == "tool_use" and b.get("name") == "Bash" and needle in (b.get("input") or {}).get("command", ""):
                     seen.add(b.get("id"))
+    return len(seen)
+
+
+NUDGES = ("tool calls inline. Delegate the remainder", "this request is growing (")
+
+
+def count_nudges(paths):
+    seen = set()
+    for p in paths:
+        for i, line in enumerate(open(p, errors="replace")):
+            if line.startswith("{") and any(n in line for n in NUDGES) and '"type":"assistant"' not in line[:200]:
+                try:
+                    seen.add((p, json.loads(line).get("uuid") or i))
+                except ValueError:
+                    pass
     return len(seen)
 
 
@@ -203,6 +218,19 @@ def git(run_dir, *a):
     return r.stdout.splitlines() if r.returncode == 0 else []
 
 
+def read_cost(path):
+    """total_cost_usd and per-model modelUsage from claude -p --output-format json."""
+    try:
+        txt = open(path, errors="replace").read().strip()
+        d = json.loads(txt)
+        if isinstance(d, list):  # stream-style array: take the result event
+            d = next(x for x in d if x.get("type") == "result")
+    except (OSError, ValueError, StopIteration, TypeError):
+        return None
+    return {"total_cost_usd": d.get("total_cost_usd"), "is_error": d.get("is_error"),
+            "num_turns": d.get("num_turns"), "modelUsage": d.get("modelUsage")}
+
+
 def cmd_run(a):
     time.sleep(2)  # let session-end cleanup finish before looking
     left = find_leftovers(a.session, a.run_dir)
@@ -220,6 +248,7 @@ def cmd_run(a):
         res["verify_tail"] = open(a.verify_log, errors="replace").read().splitlines()[-30:] if a.verify_log else []
     except OSError:
         res["verify_tail"] = []
+    res["cost"] = read_cost(a.result_json)
     ts = token_stats(a.session)
     if ts is None:
         res["error"] = "transcript not found"
@@ -300,6 +329,7 @@ def main():
     r.add_argument("--timed-out", action="store_true")
     r.add_argument("--out")
     r.add_argument("--verify-log")
+    r.add_argument("--result-json")
     s = sub.add_parser("summary")
     s.add_argument("dir")
     a = ap.parse_args()

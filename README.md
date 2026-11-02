@@ -22,17 +22,25 @@ To test without installing, run `claude --plugin-dir ./plugin`.
 
 ### 3.1 Coordinator limits
 
-The limits apply to the coordinator only, per user message. They apply when `coordinator` is `true`. Claude Code bookkeeping paths (auto-memory, plans, session scratchpad) are exempt.
+These rules apply to the coordinator only, per user message, when `coordinator` is `true`. Claude Code bookkeeping paths (auto-memory, plans, session scratchpad) are exempt. `#solo` in the message silences all nudges and the refusals below.
 
-| Rule | Limit | Override |
+**Nudges.** brood adds context to the model and does not block the call. Each nudge fires once per message. `0` disables a threshold.
+
+| Trigger | Threshold | Nudge |
 |---|---|---|
-| Work tool calls (Bash, Read, Grep, Glob, Edit, Write, MultiEdit, NotebookEdit, WebFetch, WebSearch) | `main_tool_budget` = 3 | `#solo` in the message |
-| Files edited | 1 | `#solo` |
-| Lines changed in one edit | `trivial_edit_lines` = 10 | `#solo` |
-| Foreground build, test or replay | 0 | `run_in_background`, or `#solo` |
-| `general-purpose` agent without `model` | refused | Set `model`, or use a brood agent |
+| Work tool calls (Bash, Read, Grep, Glob, Edit, Write, MultiEdit, NotebookEdit, WebFetch, WebSearch) | `main_tool_budget` = 3 | Soft: "this request is growing". |
+| Distinct files edited | 3 | Soft. |
+| Lines changed in one edit | `trivial_edit_lines` = 30 | Soft. |
+| Work tool calls | `firm_nudge_after` = 8 | Firm: "delegate the remainder now". |
 
-A refused call returns "delegate this". Git-only commands and `free_commands` matches do not count toward the budget. The budget also resets when the coordinator turn ends.
+**Refusals.**
+
+| Rule | Override |
+|---|---|
+| Foreground build or replay (`cargo build`, `make`, `npm run build`, game runs). Tests and checks (`cargo test`, `pytest`, `go test`, `npm test`, `cargo check`, `clippy`) run inline | `run_in_background`, or `#solo` |
+| `general-purpose` agent without `model` | Set `model`, or use a brood agent |
+
+Git-only commands and `free_commands` matches do not count toward the nudges. The counts reset when the coordinator turn ends.
 
 ### 3.2 Subagent rules
 
@@ -98,9 +106,10 @@ The file is optional. Every key is optional.
 | `loop_streak` | `4` | Identical commands in a row before refusal. `0` = off. |
 | `cleanup_retries` | `2` | Times brood sends a subagent back before it cleans up. |
 | `max_helpers` | `3` | Helpers per subagent. `0` = no cap. |
-| `main_tool_budget` | `3` | Work tool calls per message for the coordinator. `0` = no limit. |
-| `trivial_edit_lines` | `10` | Largest edit for the coordinator. `0` = no limit. |
-| `free_commands` | `[]` | Regexes for shell commands that do not count toward the budget. |
+| `main_tool_budget` | `3` | Work tool calls per message that trigger the soft nudge. `0` = off. |
+| `trivial_edit_lines` | `30` | Edit size (lines) that triggers the soft nudge. `0` = off. |
+| `firm_nudge_after` | `8` | Work tool calls per message that trigger the firm nudge. `0` = off. |
+| `free_commands` | `[]` | Regexes for shell commands that do not count toward the nudges. |
 | `scan_tools` | `^(WebFetch\|WebSearch\|mcp__.*)$` | Regex on tool names whose output brood scans. |
 | `extra_secret_patterns` | `[]` | Extra regexes for secrets. |
 | `extra_injection_patterns` | `[]` | Extra regexes for instruction-like text. |
@@ -140,7 +149,7 @@ The data directory is `~/.local/share/brood` (Linux), `~/Library/Application Sup
 | Problem | Action |
 |---|---|
 | Hooks do nothing | Make sure `brood --version` works in the shell Claude Code uses. |
-| Coordinator refuses a small task | Add `#solo` to the message. Or raise `main_tool_budget`. |
+| Coordinator refuses a small task | Only a foreground build or replay is refused: run it in the background. Add `#solo` to the message to allow it. Nudges are advice: raise `main_tool_budget` or `firm_nudge_after`, or set them to `0`. |
 | Config has no effect | Check the TOML syntax. brood uses all defaults if the file does not parse. |
 | Processes remain | Run `brood ps`, then `brood gc`. |
 

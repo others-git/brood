@@ -13,11 +13,13 @@ pub struct Config {
     pub cleanup_retries: u32,
     /// Most helpers one subagent may spawn. The main session has no cap.
     pub max_helpers: u32,
-    /// Work tool calls (read, search, edit, shell) the main session may make per
-    /// user message in coordinator mode before it must delegate. 0 = no limit.
+    /// Work tool calls (read, search, edit, shell) per user message at which the
+    /// coordinator gets a soft nudge to delegate. 0 = no nudge.
     pub main_tool_budget: u32,
-    /// Largest edit (in lines) the main session may make itself in coordinator mode.
+    /// An edit larger than this many lines triggers the soft nudge. 0 = never.
     pub trivial_edit_lines: u32,
+    /// Work tool calls per user message at which the coordinator gets a firm nudge. 0 = none.
+    pub firm_nudge_after: u32,
     /// Regexes for shell commands that don't count toward the work budget
     /// (matched against each simple command). Commands made only of `git` are always free.
     pub free_commands: Vec<String>,
@@ -39,7 +41,8 @@ impl Default for Config {
             cleanup_retries: 2,
             max_helpers: 3,
             main_tool_budget: 3,
-            trivial_edit_lines: 10,
+            trivial_edit_lines: 30,
+            firm_nudge_after: 8,
             free_commands: vec![],
             scan_tools: r"^(WebFetch|WebSearch|mcp__.*)$".into(),
             extra_secret_patterns: vec![],
