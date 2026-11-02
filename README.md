@@ -91,14 +91,16 @@ Git-only commands and `free_commands` matches do not count toward the nudges. Th
 Off by default. Set `kanban = true` (or `BROOD_KANBAN=1`) to enable it. brood then keeps cards as markdown files in each project and serves a web board.
 
 - **Cards.** `<project>/kanban/<column>/<id>.md`. Default columns: `backlog`, `ready`, `in-progress`, `review`, `done`. The file has TOML frontmatter between `+++` lines (`id`, `title`, `rev`, `priority`, `tags`, `owner`, `created`, `updated`). The body is the description. IDs look like `20260725-a1b2-fix-login`. Commit the cards. `kanban/.locks/` is gitignored.
-- **Board server.** `brood board` runs one server per machine, on `127.0.0.1:<kanban_port>`. The SessionStart hook starts it if it is down. The sessions register on start and unregister on end. The server exits after 10 minutes with no live session. It serves all projects. Projects are identified by a normalised path, so `/mnt/d/x` (WSL) and `D:\x` (Windows) are one project.
-- **Open the board.** `http://127.0.0.1:47777/?token=<token>`. The token is the content of `board.token` in the data directory (mode 0600). Every API call needs it. Requests with a `Host` other than `127.0.0.1` or `localhost` are refused.
-- **Single writer.** Only the board writes cards, one at a time. Each update carries the card `rev`. A stale `rev` gives 409 and the current card. Edits made by hand or by `git pull` are noticed within about 2 s.
-- **Claims.** `kanban_claim` creates `kanban/.locks/<id>.lock` atomically. A lock of a dead session can be taken over. `brood gc` deletes it.
+- **Board server.** `brood board` runs one server per machine, on `127.0.0.1:<kanban_port>`. An OS file lock (`board.lock`) in the data directory allows one board; `board.pid` is for `brood gc` only. The SessionStart hook starts a board if none answers. The board is detached from the session and from `brood mcp`. Sessions register on start and unregister on end. The board exits after 10 minutes with no live session. A hook or tool that finds it gone starts a new one. It serves all projects. Projects are identified by a normalised path, so `/mnt/d/x` (WSL) and `D:\x` (Windows) are one project.
+- **Open the board.** `http://127.0.0.1:47777/?token=<token>`. The token is the content of `board.token` in the data directory (mode 0600). The page and the event stream take it in the URL. Every other call needs the `X-Brood-Token` header. Requests with a `Host` other than `127.0.0.1` or `localhost`, or with a foreign `Origin`, are refused.
+- **Identity check.** brood sends the token only to a server that proves it knows it: the client sends a random nonce to `/api/health` and checks for HMAC-SHA256(token, nonce). Another program on the port gets no token.
+- **WSL and Windows.** A WSL session and a native Windows session have separate data directories, hence separate tokens and locks. Each side runs its own board. Give them different `kanban_port` values. The cards are the same files, so both boards see the same project. Writes are safe across the two boards: a write checks `rev` and `ver` (a hash of the file) again just before it saves, and a changed file gives 409.
+- **Single writer.** Only the board writes cards, one at a time. Each write carries the card `rev` and `ver`. A stale `rev`, or a file changed by hand or by `git pull` since the card was read, gives 409 and the current card. Moving a card onto an existing id in the target column gives 409. Unknown frontmatter keys are kept. A card with broken frontmatter is shown but refused for writes (400). Outside edits are noticed within about 2 s.
+- **Claims.** `kanban_claim` creates `kanban/.locks/<id>.lock` atomically. A lock of a dead session can be taken over. `brood gc` deletes dead locks when no board runs.
 - **MCP tools.** `brood mcp` (registered in `plugin/.mcp.json`) gives the model `kanban_list`, `kanban_create`, `kanban_update` and `kanban_claim`. With kanban off it lists no tools.
-- **Send.** The board UI can send a card to a live session.
+- **Send.** The board UI can send a card to a live session. The card reaches the model framed as `<kanban-card>` task data that the user queued, not as a system or hook instruction. A card counts as delivered when it is claimed.
   - Hook delivery (always on): the session gets the card in the context of its next prompt, or as a `Stop` block at the end of a running turn. An idle session gets the card on its next user message.
-  - Push delivery (research preview): `brood mcp` also declares a Claude Code channel, and the card arrives at once, also in an idle session. Start Claude Code with `claude --dangerously-load-development-channels plugin:brood@brood`. Without the flag, Claude Code drops the push silently. Set `kanban_push = false` to use hook delivery only. A card is delivered once: the first path that takes it wins.
+  - Push delivery (research preview, off by default): set `kanban_push = true`. `brood mcp` then declares a Claude Code channel and sends the card at once, also to an idle session. Start Claude Code with `claude --dangerously-load-development-channels plugin:brood@brood`. Without the flag, Claude Code drops the push silently, and brood cannot tell. A push removes nothing: if the card is still unclaimed 60 s later, the hooks deliver it too.
 - **First launch.** If a git project has no `kanban/` directory, the session start adds a hint to turn existing planning docs into cards. brood asks you before it creates any card. The first card writes `kanban/.migrated`, and the hint stops.
 
 ## 4. Commands
@@ -134,7 +136,7 @@ The file is optional. Every key is optional.
 | `kanban` | `false` | Enable the kanban board (3.6). |
 | `kanban_port` | `47777` | Board port, on 127.0.0.1. |
 | `kanban_columns` | `["backlog","ready","in-progress","review","done"]` | Board columns, left to right. Letters, digits, `-` and `_`. |
-| `kanban_push` | `true` | Also push sent cards as channel events (needs the launch flag in 3.6). |
+| `kanban_push` | `false` | Also push sent cards as channel events (needs the launch flag in 3.6). |
 | `worktree_junk` | `[]` | Extra `name/` or `*.ext` patterns the worktree-remove guard ignores, on top of `__pycache__/`, `*.pyc`, `node_modules/`, `target/` and similar. Untracked files only. |
 
 ```toml
@@ -169,7 +171,7 @@ The data directory is `~/.local/share/brood` (Linux), `~/Library/Application Sup
 | File | Content |
 |---|---|
 | `sessions/<session_id>/brood.log` | Denials, releases and kills of one session |
-| `board.lock`, `board.token`, `board-state.json` | Kanban board pid and port, access token, registered sessions and sent cards |
+| `board.lock`, `board.pid`, `board.token`, `board-state.json` | Kanban board lock, pid and port, access token, registered sessions and sent cards |
 | `brood.log` | Hook errors, and raw events when `BROOD_DEBUG=1` |
 
 | Problem | Action |
@@ -190,8 +192,6 @@ The data directory is `~/.local/share/brood` (Linux), `~/Library/Application Sup
 **CAUTION:** Agent-team teammates do not appear in `claude -p` runs. This mode is untested.
 
 **CAUTION:** CI tests Windows and macOS builds only. Native use on those systems is not otherwise tested.
-
-**CAUTION:** Kanban edits that bypass the board (by hand, `git pull`) do not raise `rev`. A board edit made from an older view can overwrite them.
 
 **NOTE:** brood fails open. If the hook fails, the tool call goes on.
 

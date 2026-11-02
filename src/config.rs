@@ -36,6 +36,7 @@ pub struct Config {
     /// Port of the per-machine board server (127.0.0.1 only). Env `BROOD_KANBAN_PORT` overrides.
     pub kanban_port: u16,
     /// With kanban on, `brood mcp` also pushes sent cards as Claude Code channel events (research preview).
+    /// Off by default: the client does not tell brood whether it loaded the channel.
     pub kanban_push: bool,
     /// Board columns, left to right. Each is a directory under `<project>/kanban/`.
     pub kanban_columns: Vec<String>,
@@ -58,7 +59,7 @@ impl Default for Config {
             worktree_junk: vec![],
             kanban: false,
             kanban_port: 47777,
-            kanban_push: true,
+            kanban_push: false,
             kanban_columns: default_columns(),
         }
     }

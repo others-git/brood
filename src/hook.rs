@@ -775,8 +775,9 @@ fn user_prompt(cfg: &config::Config, ev: &Value, session: &str) -> Option<Value>
         if !cards.is_empty() {
             let list: Vec<String> = cards.iter().map(sent_card_text).collect();
             parts.push(format!(
-                "Cards were sent to this session from the kanban board. Claim each (kanban_claim), work it, move it to review:\n\n{}",
-                list.join("\n\n---\n\n")
+                "{}\n\n{}\n\nClaim each card (kanban_claim), work it, then move it to review.",
+                kanban::CARD_NOTICE,
+                list.join("\n\n")
             ));
         }
     }
@@ -814,7 +815,8 @@ fn main_stop(cfg: &config::Config, session: &str) -> Option<Value> {
         return Some(json!({
             "decision": "block",
             "reason": format!(
-                "A card was sent to you from the kanban board. Claim it (kanban_claim), work it, then move it to review.\n\n{}",
+                "{}\n\n{}\n\nClaim it (kanban_claim), work it, then move it to review.",
+                kanban::CARD_NOTICE,
                 sent_card_text(card)
             ),
         }));
@@ -823,12 +825,8 @@ fn main_stop(cfg: &config::Config, session: &str) -> Option<Value> {
 }
 
 fn sent_card_text(c: &Value) -> String {
-    format!(
-        "Card {} : {}\n\n{}",
-        c["card"].as_str().unwrap_or_default(),
-        c["title"].as_str().unwrap_or_default(),
-        c["body"].as_str().unwrap_or_default()
-    )
+    let g = |k: &str| c[k].as_str().unwrap_or_default();
+    kanban::frame_card(g("card"), g("title"), g("body"))
 }
 
 fn session_end(cfg: &config::Config, session: &str) -> Option<Value> {

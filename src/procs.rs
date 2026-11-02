@@ -153,24 +153,6 @@ pub fn alive_pids(pids: &[u32]) -> HashSet<u32> {
         .collect()
 }
 
-/// Command line of a running process.
-pub fn pid_cmd(pid: u32) -> Option<String> {
-    let mut sys = System::new().ok()?;
-    sys.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
-        true,
-        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
-    );
-    let p = sys.process(Pid::from_u32(pid))?;
-    Some(
-        p.cmd()
-            .iter()
-            .map(|a| a.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(" "),
-    )
-}
-
 /// The Bash tool runs commands as `bash -c "source .../shell-snapshots/snapshot-... && eval '<cmd>' && pwd -P ..."`.
 pub fn is_tool_shell(cmd: &str) -> bool {
     cmd.contains("shell-snapshots/snapshot-") || cmd.contains("shell-snapshots\\snapshot-")

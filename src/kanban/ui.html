@@ -108,7 +108,7 @@ function render() {
       e.preventDefault(); el.classList.remove("over");
       const c = cards.find(x => x.id === e.dataTransfer.getData("text/plain"));
       if (!c || c.column === col) return;
-      const r = await api("POST", `/api/projects/${project}/cards/${c.id}/move`, {rev: c.rev, column: col});
+      const r = await api("POST", `/api/projects/${project}/cards/${c.id}/move`, {rev: c.rev, ver: c.ver, column: col});
       if (r.status === 409) note("changed elsewhere, reloaded");
       else if (r.status !== 200) note(r.data && r.data.error || "move failed");
       await loadCards();
@@ -140,7 +140,7 @@ $("save").onclick = async () => {
     tags: $("f-tags").value.split(",").map(t => t.trim()).filter(Boolean)};
   if (!body.title.trim()) { note("title required"); return; }
   let r;
-  if (editing) r = await api("PATCH", `/api/projects/${project}/cards/${editing.id}`, {...body, rev: editing.rev});
+  if (editing) r = await api("PATCH", `/api/projects/${project}/cards/${editing.id}`, {...body, rev: editing.rev, ver: editing.ver});
   else r = await api("POST", `/api/projects/${project}/cards`, body);
   if (r.status === 409) note("changed elsewhere, reloaded");
   else if (r.status >= 400) { note(r.data && r.data.error || "save failed"); return; }

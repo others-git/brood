@@ -3,26 +3,54 @@
 //! happen under one mutex, inside this process.
 
 use super::store::{self, Err, NewCard, Patch};
-use super::{client, now_secs, paths, rand_hex};
+use super::{client, now_secs, paths, rand_hex, valid_sid};
 use crate::{config::Config, procs, state};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
-use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::fs::{File, OpenOptions, TryLockError};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const UI: &str = include_str!("ui.html");
 const IDLE_DEFAULT_SECS: u64 = 600;
-/// A card handed to the push transport but never acked becomes takeable by hooks again after this.
-const INFLIGHT_SECS: u64 = 60;
+/// A pushed card that is still unclaimed after this is delivered by the hooks too.
+const PUSH_GRACE_SECS: u64 = 60;
+const MAX_CONNS: usize = 64;
 
+/// Held (OS file lock) for the whole life of the board: the single-instance guard.
 fn lock_path() -> PathBuf {
     state::root().join("board.lock")
+}
+
+/// Pid and port of the running board. For gc to read; never used to decide who runs.
+fn pid_path() -> PathBuf {
+    state::root().join("board.pid")
+}
+
+/// Take the board's OS lock. None: another board holds it.
+pub fn acquire_lock(path: &std::path::Path) -> std::io::Result<Option<File>> {
+    let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    match f.try_lock() {
+        Ok(()) => Ok(Some(f)),
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(TryLockError::Error(e)) => Err(e),
+    }
+}
+
+/// Is a board running right now (does someone hold the lock)?
+pub fn board_running() -> bool {
+    matches!(acquire_lock(&lock_path()), Ok(None))
 }
 
 fn state_path() -> PathBuf {
@@ -31,7 +59,7 @@ fn state_path() -> PathBuf {
 
 /// Pid in the lock file (the board's own pid), if any.
 pub fn lock_pid() -> Option<u32> {
-    std::fs::read_to_string(lock_path())
+    std::fs::read_to_string(pid_path())
         .ok()?
         .lines()
         .next()?
@@ -64,9 +92,9 @@ pub struct Sent {
     pub title: String,
     pub body: String,
     pub at: u64,
-    /// When the push transport took it (0 = not taken). Set until acked.
+    /// When the push transport got it (0 = not pushed). It stays queued until the card is claimed.
     #[serde(default)]
-    pub inflight: u64,
+    pub pushed: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -90,6 +118,79 @@ impl Default for Inner {
             idle_since: Instant::now(),
         }
     }
+}
+
+/// A sent card is delivered once the card is claimed (owner set) or the hooks took it.
+/// The push path (`pull_for_push`) only marks it; the hooks (`take_for_hook`) deliver cards
+/// never pushed, or pushed more than `PUSH_GRACE_SECS` ago and still unclaimed.
+fn hook_takeable(it: &Sent, now: u64) -> bool {
+    it.pushed == 0 || now.saturating_sub(it.pushed) > PUSH_GRACE_SECS
+}
+
+pub fn take_for_hook(
+    inner: &mut Inner,
+    sid: &str,
+    now: u64,
+    max: usize,
+    settled: &dyn Fn(&Sent) -> bool,
+) -> Vec<Sent> {
+    let Some(q) = inner.queue.get_mut(sid) else {
+        return vec![];
+    };
+    let mut out = vec![];
+    q.retain(|it| {
+        if settled(it) {
+            return false;
+        }
+        if hook_takeable(it, now) && out.len() < max {
+            out.push(it.clone());
+            return false;
+        }
+        true
+    });
+    out
+}
+
+pub fn pull_for_push(
+    inner: &mut Inner,
+    sid: &str,
+    now: u64,
+    settled: &dyn Fn(&Sent) -> bool,
+) -> Vec<Sent> {
+    let Some(q) = inner.queue.get_mut(sid) else {
+        return vec![];
+    };
+    q.retain(|it| !settled(it));
+    q.iter_mut()
+        .filter(|it| it.pushed == 0)
+        .map(|it| {
+            it.pushed = now;
+            it.clone()
+        })
+        .collect()
+}
+
+/// A card was claimed: it needs no delivery to anyone.
+pub fn forget_card(inner: &mut Inner, project: &str, card: &str) {
+    for q in inner.queue.values_mut() {
+        q.retain(|i| !(i.card == card && i.project == project));
+    }
+}
+
+/// Gone or claimed (by anyone): nothing left to deliver.
+fn card_settled(roots: &HashMap<String, PathBuf>, cols: &[String], it: &Sent) -> bool {
+    roots
+        .get(&it.project)
+        .and_then(|r| store::find(r, cols, &it.card))
+        .is_none_or(|(_, c)| !c.meta.owner.is_empty())
+}
+
+fn roots_of(inner: &Inner) -> HashMap<String, PathBuf> {
+    inner
+        .projects
+        .values()
+        .map(|p| (p.id.clone(), paths::native(&p.key)))
+        .collect()
 }
 
 /// How a sent card reaches a session. `QueueDelivery` parks it for the hooks
@@ -116,6 +217,7 @@ struct Shared {
     token: String,
     columns: Vec<String>,
     delivery: Box<dyn Delivery>,
+    conns: AtomicUsize,
 }
 
 fn save_state(inner: &Inner) {
@@ -213,6 +315,7 @@ fn write_resp(mut s: &TcpStream, status: u16, ctype: &str, body: &str) {
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
+        503 => "Service Unavailable",
         404 => "Not Found",
         409 => "Conflict",
         _ => "Error",
@@ -246,28 +349,61 @@ fn token_ok(given: &str, want: &str) -> bool {
             == 0
 }
 
+fn origin_ok(origin: Option<&String>) -> bool {
+    origin.is_none_or(|o| {
+        o.strip_prefix("http://")
+            .is_some_and(|h| host_ok(Some(&h.to_owned())))
+    })
+}
+
+struct ConnGuard<'a>(&'a AtomicUsize);
+impl Drop for ConnGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 fn handle_conn(sh: Arc<Shared>, stream: TcpStream) {
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+    if sh.conns.fetch_add(1, Ordering::SeqCst) >= MAX_CONNS {
+        sh.conns.fetch_sub(1, Ordering::SeqCst);
+        write_resp(&stream, 503, "application/json", r#"{"error":"busy"}"#);
+        return;
+    }
+    let _guard = ConnGuard(&sh.conns);
     let Some(req) = read_req(&stream) else {
         return;
     };
-    // DNS-rebinding defence: only our own loopback names.
-    if !host_ok(req.headers.get("host")) {
-        write_resp(&stream, 403, "application/json", r#"{"error":"bad host"}"#);
-        return;
-    }
-    if req.method == "GET" && req.path == "/api/health" {
+    // DNS-rebinding defence: only our own loopback names, and no foreign page origins.
+    if !host_ok(req.headers.get("host")) || !origin_ok(req.headers.get("origin")) {
         write_resp(
             &stream,
-            200,
+            403,
             "application/json",
-            r#"{"ok":true,"name":"brood-board"}"#,
+            r#"{"error":"bad host or origin"}"#,
         );
         return;
     }
+    if req.method == "GET" && req.path == "/api/health" {
+        // Challenge: prove knowledge of the token without revealing it.
+        let nonce = req.query.get("nonce").filter(|n| {
+            !n.is_empty() && n.len() <= 128 && n.bytes().all(|b| b.is_ascii_hexdigit())
+        });
+        let out = match nonce {
+            Some(n) => {
+                json!({"ok": true, "name": "brood-board", "proof": client::proof(&sh.token, n)})
+            }
+            None => json!({"ok": true, "name": "brood-board"}),
+        };
+        write_resp(&stream, 200, "application/json", &out.to_string());
+        return;
+    }
+    // The token travels in a header; the URL form is for the page load and the event stream only.
+    let query_ok = req.path == "/" || req.path == "/api/events";
     let given = req
         .headers
         .get("x-brood-token")
-        .or_else(|| req.query.get("token"))
+        .or_else(|| req.query.get("token").filter(|_| query_ok))
         .map_or("", String::as_str);
     if !token_ok(given, &sh.token) {
         write_resp(&stream, 401, "application/json", r#"{"error":"bad token"}"#);
@@ -332,6 +468,10 @@ fn err(status: u16, msg: &str) -> (u16, Value) {
 fn store_err(e: Err) -> (u16, Value) {
     match e {
         Err::NotFound => err(404, "no such card"),
+        Err::Duplicate(c) => (
+            409,
+            json!({"error": "a card with this id already exists in the target column", "card": c}),
+        ),
         Err::BadRequest(m) => err(400, &m),
         Err::Conflict(c) => (409, json!({"error": "rev mismatch", "card": c})),
         Err::Claimed(o) => (409, json!({"error": "claimed", "owner": o})),
@@ -405,6 +545,9 @@ fn route(sh: &Arc<Shared>, req: &Req, body: &Value) -> (u16, Value) {
             let (Some(sid), Some(path)) = (s(body, "session"), s(body, "path")) else {
                 return err(400, "session and path required");
             };
+            if !valid_sid(&sid) {
+                return err(400, "bad session id");
+            }
             let mut g = sh.inner.lock().unwrap();
             let p = match open_project(&mut g, &path) {
                 Ok(p) => p,
@@ -439,29 +582,24 @@ fn route(sh: &Arc<Shared>, req: &Req, body: &Value) -> (u16, Value) {
             broadcast(sh, json!({"type": "sessions"}));
             (200, json!({"ok": true}))
         }
-        // Hook delivery: take sent cards (skips ones the push transport has in flight).
+        // Hook delivery: sent cards never pushed, or pushed long ago and still unclaimed.
         ("POST", ["api", "sessions", sid, "take"]) => {
-            let max = body["max"].as_u64().unwrap_or(100) as usize;
-            let now = now_secs();
-            let mut g = sh.inner.lock().unwrap();
-            let q = g.queue.entry((*sid).to_owned()).or_default();
-            let mut taken = vec![];
-            q.retain(|it| {
-                let free = it.inflight == 0 || now.saturating_sub(it.inflight) > INFLIGHT_SECS;
-                if free && taken.len() < max {
-                    taken.push(it.clone());
-                    false
-                } else {
-                    true
-                }
-            });
-            if !taken.is_empty() {
-                save_state(&g);
+            if !valid_sid(sid) {
+                return err(400, "bad session id");
             }
+            let max = body["max"].as_u64().unwrap_or(100) as usize;
+            let mut g = sh.inner.lock().unwrap();
+            let roots = roots_of(&g);
+            let settled = |it: &Sent| card_settled(&roots, cols, it);
+            let taken = take_for_hook(&mut g, sid, now_secs(), max, &settled);
+            save_state(&g);
             (200, json!({"cards": taken}))
         }
-        // Push delivery: long-poll for cards not yet handed out. They stay queued, in flight, until acked.
+        // Push delivery: long-poll for cards not yet pushed. They stay queued until the card is claimed.
         ("GET", ["api", "sessions", sid, "inbox"]) => {
+            if !valid_sid(sid) {
+                return err(400, "bad session id");
+            }
             let wait: u64 = req
                 .query
                 .get("wait")
@@ -471,14 +609,9 @@ fn route(sh: &Arc<Shared>, req: &Req, body: &Value) -> (u16, Value) {
             loop {
                 {
                     let mut g = sh.inner.lock().unwrap();
-                    let now = now_secs();
-                    let mut out = vec![];
-                    if let Some(q) = g.queue.get_mut(*sid) {
-                        for it in q.iter_mut().filter(|i| i.inflight == 0) {
-                            it.inflight = now;
-                            out.push(it.clone());
-                        }
-                    }
+                    let roots = roots_of(&g);
+                    let settled = |it: &Sent| card_settled(&roots, cols, it);
+                    let out = pull_for_push(&mut g, sid, now_secs(), &settled);
                     if !out.is_empty() {
                         save_state(&g);
                         return (200, json!({"cards": out}));
@@ -489,18 +622,6 @@ fn route(sh: &Arc<Shared>, req: &Req, body: &Value) -> (u16, Value) {
                 }
                 std::thread::sleep(Duration::from_millis(300));
             }
-        }
-        ("POST", ["api", "sessions", sid, "ack"]) => {
-            let seqs: Vec<u64> = body["seqs"]
-                .as_array()
-                .map(|a| a.iter().filter_map(Value::as_u64).collect())
-                .unwrap_or_default();
-            let mut g = sh.inner.lock().unwrap();
-            if let Some(q) = g.queue.get_mut(*sid) {
-                q.retain(|i| !seqs.contains(&i.seq));
-            }
-            save_state(&g);
-            (200, json!({"ok": true}))
         }
         ("POST", ["api", "shutdown"]) => {
             std::thread::spawn(|| {
@@ -551,8 +672,8 @@ fn route(sh: &Arc<Shared>, req: &Req, body: &Value) -> (u16, Value) {
             let Some(root) = project_root(sh, p) else {
                 return err(404, "no such project");
             };
-            let Some(rev) = body["rev"].as_u64() else {
-                return err(400, "rev required");
+            let (Some(rev), Some(ver)) = (body["rev"].as_u64(), s(body, "ver")) else {
+                return err(400, "rev and ver required");
             };
             let patch = Patch {
                 title: s(body, "title"),
@@ -562,7 +683,7 @@ fn route(sh: &Arc<Shared>, req: &Req, body: &Value) -> (u16, Value) {
                 owner: None,
             };
             let _g = sh.inner.lock().unwrap();
-            let r = store::update(&root, cols, id, rev, patch);
+            let r = store::update(&root, cols, id, rev, Some(&ver), patch);
             drop(_g);
             changed(sh, p, r.map(|c| (200, json!(c))))
         }
@@ -570,11 +691,13 @@ fn route(sh: &Arc<Shared>, req: &Req, body: &Value) -> (u16, Value) {
             let Some(root) = project_root(sh, p) else {
                 return err(404, "no such project");
             };
-            let (Some(rev), Some(col)) = (body["rev"].as_u64(), s(body, "column")) else {
-                return err(400, "rev and column required");
+            let (Some(rev), Some(ver), Some(col)) =
+                (body["rev"].as_u64(), s(body, "ver"), s(body, "column"))
+            else {
+                return err(400, "rev, ver and column required");
             };
             let _g = sh.inner.lock().unwrap();
-            let r = store::move_card(&root, cols, id, rev, &col);
+            let r = store::move_card(&root, cols, id, rev, Some(&ver), &col);
             drop(_g);
             changed(sh, p, r.map(|c| (200, json!(c))))
         }
@@ -585,10 +708,13 @@ fn route(sh: &Arc<Shared>, req: &Req, body: &Value) -> (u16, Value) {
             let Some(sid) = s(body, "session") else {
                 return err(400, "session required");
             };
-            let g = sh.inner.lock().unwrap();
+            let mut g = sh.inner.lock().unwrap();
             let Some((_, card)) = store::find(&root, cols, id) else {
                 return err(404, "no such card");
             };
+            if s(body, "ver").is_some_and(|v| v != card.ver) {
+                return store_err(Err::Conflict(Box::new(card)));
+            }
             let alive = |o: &str| g.sessions.contains_key(o);
             if let Err(owner) = store::try_lock(&root, id, &sid, &alive) {
                 return store_err(Err::Claimed(owner));
@@ -598,11 +724,14 @@ fn route(sh: &Arc<Shared>, req: &Req, body: &Value) -> (u16, Value) {
                 cols,
                 id,
                 card.meta.rev,
+                None,
                 Patch {
                     owner: Some(sid),
                     ..Patch::default()
                 },
             );
+            forget_card(&mut g, p, id);
+            save_state(&g);
             drop(g);
             changed(sh, p, r.map(|c| (200, json!(c))))
         }
@@ -616,6 +745,9 @@ fn route(sh: &Arc<Shared>, req: &Req, body: &Value) -> (u16, Value) {
             let Some((_, card)) = store::find(&root, cols, id) else {
                 return err(404, "no such card");
             };
+            if s(body, "ver").is_some_and(|v| v != card.ver) {
+                return store_err(Err::Conflict(Box::new(card)));
+            }
             if !store::unlock(&root, id, &sid, force) && store::lock_owner(&root, id).is_some() {
                 return store_err(Err::Claimed(
                     store::lock_owner(&root, id).unwrap_or_default(),
@@ -626,6 +758,7 @@ fn route(sh: &Arc<Shared>, req: &Req, body: &Value) -> (u16, Value) {
                 cols,
                 id,
                 card.meta.rev,
+                None,
                 Patch {
                     owner: Some(String::new()),
                     ..Patch::default()
@@ -642,7 +775,7 @@ fn route(sh: &Arc<Shared>, req: &Req, body: &Value) -> (u16, Value) {
                 return err(400, "session required");
             };
             let mut g = sh.inner.lock().unwrap();
-            if !g.sessions.contains_key(&sid) {
+            if !valid_sid(&sid) || !g.sessions.contains_key(&sid) {
                 return err(404, "session is not live");
             }
             let Some((_, card)) = store::find(&root, cols, id) else {
@@ -656,7 +789,7 @@ fn route(sh: &Arc<Shared>, req: &Req, body: &Value) -> (u16, Value) {
                 title: card.meta.title,
                 body: card.body,
                 at: now_secs(),
-                inflight: 0,
+                pushed: 0,
             };
             sh.delivery.deliver(&mut g, &sid, item);
             save_state(&g);
@@ -693,6 +826,7 @@ fn release_all(inner: &Inner, cols: &[String], sess: &Session) {
                 cols,
                 &id,
                 c.meta.rev,
+                None,
                 Patch {
                     owner: Some(String::new()),
                     ..Patch::default()
@@ -716,7 +850,7 @@ fn changed(sh: &Shared, project: &str, r: Result<(u16, Value), Err>) -> (u16, Va
 
 fn exit_cleanup() {
     if lock_pid() == Some(std::process::id()) {
-        let _ = std::fs::remove_file(lock_path());
+        let _ = std::fs::remove_file(pid_path());
     }
 }
 
@@ -802,7 +936,8 @@ fn monitor(sh: Arc<Shared>, idle_limit: Duration) {
             }
             if g.sessions.is_empty() {
                 if g.idle_since.elapsed() >= idle_limit {
-                    drop(g);
+                    // Exit while still holding the mutex: a register that has not run yet
+                    // fails (connection reset) and its client starts a new board and retries.
                     exit_cleanup();
                     std::process::exit(0);
                 }
@@ -834,55 +969,49 @@ fn write_private(path: &std::path::Path, content: &str) -> std::io::Result<()> {
     f.write_all(content.as_bytes())
 }
 
+#[cfg(unix)]
+unsafe extern "C" {
+    fn setsid() -> i32;
+}
+
 /// Entry for `brood board`. Returns the process exit code.
-pub fn run(cfg: &Config, ensure: bool) -> i32 {
+pub fn run(cfg: &Config, ensure: bool, detach: bool) -> i32 {
     if ensure {
         client::ensure_board(cfg);
         return 0;
+    }
+    if detach {
+        // Intermediate of the double spawn: new session, start the real board, exit at once.
+        #[cfg(unix)]
+        // SAFETY: setsid takes no arguments and only changes this process's session.
+        unsafe {
+            setsid();
+        }
+        let Ok(exe) = std::env::current_exe() else {
+            return 1;
+        };
+        return match client::board_command(&exe, std::env::vars().map(|(k, _)| k)).spawn() {
+            Ok(_) => 0,
+            Err(_) => 1,
+        };
     }
     let port = cfg.kanban_port;
     let root = state::root();
     let _ = std::fs::create_dir_all(&root);
 
-    // Lock: a live holder means a board is already running.
-    let mut got = false;
-    for _ in 0..3 {
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(lock_path())
-        {
-            Ok(mut f) => {
-                let _ = write!(f, "{}\n{port}\n", std::process::id());
-                got = true;
-                break;
-            }
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                if let Some(pid) = lock_pid() {
-                    let running = pid != std::process::id()
-                        && procs::alive_pids(&[pid]).contains(&pid)
-                        && (client::health(port)
-                            || procs::pid_cmd(pid).is_some_and(|c| c.contains("brood")));
-                    if running {
-                        return 0;
-                    }
-                }
-                let _ = std::fs::remove_file(lock_path()); // stale: take over
-            }
-            Err(e) => {
-                eprintln!("brood board: lock: {e}");
-                return 1;
-            }
+    // The OS lock is the single-instance guard; it is released when this process dies.
+    let _lock = match acquire_lock(&lock_path()) {
+        Ok(Some(f)) => f,
+        Ok(None) => return 0, // a board is running
+        Err(e) => {
+            eprintln!("brood board: lock: {e}");
+            return 1;
         }
-    }
-    if !got {
-        return 0; // lost a race with another starter
-    }
+    };
     let listener = match TcpListener::bind(("127.0.0.1", port)) {
         Ok(l) => l,
         Err(e) => {
-            exit_cleanup();
-            if client::health(port) {
+            if client::board_up(cfg) {
                 return 0;
             }
             eprintln!("brood board: cannot bind 127.0.0.1:{port}: {e}");
@@ -891,10 +1020,10 @@ pub fn run(cfg: &Config, ensure: bool) -> i32 {
     };
     let token = rand_hex(32);
     if let Err(e) = write_private(&client::token_path(), &token) {
-        exit_cleanup();
         eprintln!("brood board: token: {e}");
         return 1;
     }
+    let _ = std::fs::write(pid_path(), format!("{}\n{port}\n", std::process::id()));
 
     let mut inner: Inner = std::fs::read_to_string(state_path())
         .ok()
@@ -907,6 +1036,7 @@ pub fn run(cfg: &Config, ensure: bool) -> i32 {
         token,
         columns: cfg.kanban_columns.clone(),
         delivery: Box::new(QueueDelivery),
+        conns: AtomicUsize::new(0),
     });
     let idle = std::env::var("BROOD_BOARD_IDLE_SECS")
         .ok()
@@ -944,19 +1074,73 @@ mod tests {
         assert!(!token_ok("", "abc"));
     }
 
-    #[test]
-    fn queue_delivery_parks_items() {
-        let mut inner = Inner::default();
-        let item = Sent {
-            seq: 1,
-            card: "c".into(),
+    fn sent(seq: u64, card: &str) -> Sent {
+        Sent {
+            seq,
+            card: card.into(),
             project: "p".into(),
             title: "t".into(),
             body: "b".into(),
             at: 0,
-            inflight: 0,
-        };
-        QueueDelivery.deliver(&mut inner, "s1", item);
+            pushed: 0,
+        }
+    }
+
+    #[test]
+    fn queue_delivery_parks_items() {
+        let mut inner = Inner::default();
+        QueueDelivery.deliver(&mut inner, "s1", sent(1, "c"));
         assert_eq!(inner.queue["s1"].len(), 1);
+    }
+
+    #[test]
+    fn push_does_not_consume_a_card() {
+        let open = |_: &Sent| false;
+        let mut inner = Inner::default();
+        QueueDelivery.deliver(&mut inner, "s1", sent(1, "c1"));
+        // Push gets it once and leaves it queued.
+        assert_eq!(pull_for_push(&mut inner, "s1", 1000, &open).len(), 1);
+        assert_eq!(pull_for_push(&mut inner, "s1", 1001, &open).len(), 0);
+        assert_eq!(inner.queue["s1"].len(), 1);
+        // Hooks skip it while the push is fresh ...
+        assert!(take_for_hook(&mut inner, "s1", 1030, 9, &open).is_empty());
+        // ... and deliver it when it is still unclaimed after the grace period.
+        let got = take_for_hook(&mut inner, "s1", 1000 + PUSH_GRACE_SECS + 1, 9, &open);
+        assert_eq!(got.len(), 1);
+        assert!(inner.queue["s1"].is_empty());
+    }
+
+    #[test]
+    fn claimed_card_is_not_delivered() {
+        let mut inner = Inner::default();
+        QueueDelivery.deliver(&mut inner, "s1", sent(1, "c1"));
+        QueueDelivery.deliver(&mut inner, "s1", sent(2, "c2"));
+        pull_for_push(&mut inner, "s1", 1000, &|_| false);
+        // Claimed through the API: forgotten everywhere.
+        forget_card(&mut inner, "p", "c1");
+        assert_eq!(inner.queue["s1"].len(), 1);
+        // c2 got claimed (owner set): settled, dropped by the hook.
+        let settled = |it: &Sent| it.card == "c2";
+        assert!(take_for_hook(&mut inner, "s1", 5000, 9, &settled).is_empty());
+        assert!(inner.queue["s1"].is_empty());
+    }
+
+    #[test]
+    fn os_lock_allows_one_holder() {
+        let p = std::env::temp_dir().join(format!("brood-lock-{}", std::process::id()));
+        let first = acquire_lock(&p).unwrap();
+        assert!(first.is_some());
+        assert!(acquire_lock(&p).unwrap().is_none());
+        drop(first);
+        assert!(acquire_lock(&p).unwrap().is_some());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn origin_check() {
+        assert!(origin_ok(None));
+        assert!(origin_ok(Some(&"http://127.0.0.1:47777".to_string())));
+        assert!(!origin_ok(Some(&"http://evil.example".to_string())));
+        assert!(!origin_ok(Some(&"null".to_string())));
     }
 }

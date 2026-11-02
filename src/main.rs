@@ -37,6 +37,9 @@ enum Cmd {
         /// Start a detached board if none answers, then exit.
         #[arg(long)]
         ensure: bool,
+        /// Internal: the short-lived first stage that starts a board outside the caller's process tree.
+        #[arg(long, hide = true)]
+        detach: bool,
     },
     /// Stdio MCP server for the kanban tools (started by the plugin).
     Mcp,
@@ -70,15 +73,20 @@ fn main() {
             }
             if !dry_run {
                 state::prune_old_sessions();
-                let n = kanban::board::sweep_dead_locks();
+                // A running board owns the claim locks (it knows the live sessions).
+                let n = if kanban::board::board_running() {
+                    0
+                } else {
+                    kanban::board::sweep_dead_locks()
+                };
                 if n > 0 {
                     println!("{n} stale kanban lock(s) removed");
                 }
             }
             println!("{} process(es)", killed.len());
         }
-        Cmd::Board { ensure } => {
-            std::process::exit(kanban::board::run(&config::load(), ensure));
+        Cmd::Board { ensure, detach } => {
+            std::process::exit(kanban::board::run(&config::load(), ensure, detach));
         }
         Cmd::Mcp => std::process::exit(kanban::mcp::run(&config::load())),
         Cmd::Merge {

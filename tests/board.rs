@@ -111,6 +111,7 @@ fn board_lifecycle_over_http() {
     assert_eq!(st, 201, "{body}");
     let card: serde_json::Value = serde_json::from_str(&body).unwrap();
     let id = card["id"].as_str().unwrap().to_owned();
+    let ver1 = card["ver"].as_str().unwrap().to_owned();
     assert_eq!(card["rev"], 1);
     assert_eq!(card["column"], "backlog");
 
@@ -120,9 +121,13 @@ fn board_lifecycle_over_http() {
         &format!("/api/projects/{pid}/cards/{id}/move"),
         t,
         h,
-        r#"{"rev":1,"column":"in-progress"}"#,
+        &format!(r#"{{"rev":1,"ver":"{ver1}","column":"in-progress"}}"#),
     );
     assert_eq!(st, 200, "{body}");
+    let ver2 = serde_json::from_str::<serde_json::Value>(&body).unwrap()["ver"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     assert!(
         project
             .join("kanban/in-progress")
@@ -137,12 +142,50 @@ fn board_lifecycle_over_http() {
         &format!("/api/projects/{pid}/cards/{id}"),
         t,
         h,
-        r#"{"rev":1,"title":"stale"}"#,
+        &format!(r#"{{"rev":1,"ver":"{ver1}","title":"stale"}}"#),
     );
     assert_eq!(st, 409, "{body}");
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["card"]["rev"], 2);
     assert_eq!(v["card"]["column"], "in-progress");
+
+    // A hand edit that leaves rev alone: the next write with the old ver is a 409 and the edit survives.
+    let file = project.join("kanban/in-progress").join(format!("{id}.md"));
+    let text = std::fs::read_to_string(&file)
+        .unwrap()
+        .replace("hi", "edited by hand");
+    std::fs::write(&file, text).unwrap();
+    let (st, body) = http(
+        port,
+        "PATCH",
+        &format!("/api/projects/{pid}/cards/{id}"),
+        t,
+        h,
+        &format!(r#"{{"rev":2,"ver":"{ver2}","title":"clobber"}}"#),
+    );
+    assert_eq!(st, 409, "{body}");
+    assert!(
+        std::fs::read_to_string(&file)
+            .unwrap()
+            .contains("edited by hand")
+    );
+    assert_eq!(
+        http(
+            port,
+            "PATCH",
+            &format!("/api/projects/{pid}/cards/{id}"),
+            t,
+            h,
+            r#"{"rev":2,"title":"no ver"}"#
+        )
+        .0,
+        400
+    );
+    // The token in the URL is for the page and the event stream only.
+    assert_eq!(
+        http(port, "GET", &format!("/api/projects?token={t}"), "", h, "").0,
+        401
+    );
 
     // Claim: first session wins, a second live one is refused.
     for s in ["sess-a", "sess-b"] {
@@ -169,11 +212,47 @@ fn board_lifecycle_over_http() {
     assert_eq!(claim("sess-a"), 200);
     assert_eq!(claim("sess-b"), 409);
 
-    // Send, then take (hook path).
+    // Send an unclaimed card, then take (hook path). A claimed card is not delivered.
+    let (_, c2) = http(
+        port,
+        "POST",
+        &format!("/api/projects/{pid}/cards"),
+        t,
+        h,
+        r#"{"title":"second"}"#,
+    );
+    let id2 = serde_json::from_str::<serde_json::Value>(&c2).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     let (st, _) = http(
         port,
         "POST",
         &format!("/api/projects/{pid}/cards/{id}/send"),
+        t,
+        h,
+        r#"{"session":"sess-b"}"#,
+    );
+    assert_eq!(st, 200);
+    let (_, body) = http(
+        port,
+        "POST",
+        "/api/sessions/sess-b/take",
+        t,
+        h,
+        r#"{"max":5}"#,
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["cards"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    let (st, _) = http(
+        port,
+        "POST",
+        &format!("/api/projects/{pid}/cards/{id2}/send"),
         t,
         h,
         r#"{"session":"sess-b"}"#,
@@ -215,4 +294,40 @@ fn board_lifecycle_over_http() {
         std::thread::sleep(Duration::from_millis(100));
     }
     panic!("board did not exit after shutdown");
+}
+
+#[test]
+fn two_starters_make_one_board() {
+    let base = std::env::temp_dir().join(format!("brood-it2-{}", std::process::id()));
+    let data = base.join("data");
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let start = || {
+        Command::new(env!("CARGO_BIN_EXE_brood"))
+            .arg("board")
+            .env("BROOD_DATA_DIR", &data)
+            .env("BROOD_KANBAN_PORT", port.to_string())
+            .env("XDG_CONFIG_HOME", base.join("cfg"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    };
+    let mut kids: Vec<Board> = (0..3).map(|_| Board(start())).collect();
+    std::thread::sleep(Duration::from_millis(2500));
+    let mut running = 0;
+    for k in &mut kids {
+        match k.0.try_wait().unwrap() {
+            None => running += 1,
+            Some(st) => assert!(st.success(), "loser must exit 0"),
+        }
+    }
+    assert_eq!(running, 1, "exactly one board may run");
+    // The survivor answers a challenge only the token holder can answer.
+    let (st, body) = http(port, "GET", "/api/health?nonce=abcd", "", "127.0.0.1", "");
+    assert_eq!(st, 200);
+    assert!(body.contains("\"proof\""), "{body}");
 }

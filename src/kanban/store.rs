@@ -21,6 +21,9 @@ pub struct Meta {
     pub owner: String,
     pub created: String,
     pub updated: String,
+    /// Frontmatter keys brood does not know: kept, so a rewrite never drops them.
+    #[serde(flatten)]
+    pub extra: toml::Table,
 }
 
 impl Default for Meta {
@@ -34,6 +37,7 @@ impl Default for Meta {
             owner: String::new(),
             created: String::new(),
             updated: String::new(),
+            extra: toml::Table::new(),
         }
     }
 }
@@ -44,11 +48,17 @@ pub struct Card {
     pub meta: Meta,
     pub body: String,
     pub column: String,
+    /// Hash of the raw file bytes. A writer sends it back; a mismatch means the file changed.
+    pub ver: String,
+    /// The frontmatter did not parse. Such a card is shown but never rewritten.
+    #[serde(skip)]
+    pub malformed: bool,
 }
 
 #[derive(Debug)]
 pub enum Err {
     NotFound,
+    Duplicate(Box<Card>),
     BadRequest(String),
     Conflict(Box<Card>),
     Claimed(String),
@@ -74,14 +84,27 @@ pub fn dir(root: &Path) -> PathBuf {
     root.join("kanban")
 }
 
-pub fn render(c: &Card) -> String {
-    let meta = toml::to_string(&c.meta).unwrap_or_default();
-    format!("+++\n{meta}+++\n\n{}\n", c.body.trim_end())
+/// FNV-1a over the raw file text, as 16 hex digits.
+pub fn ver_of(text: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in text.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+pub fn render(c: &Card) -> Result<String, Err> {
+    let table = toml::Value::try_from(&c.meta).map_err(|e| Err::Io(format!("frontmatter: {e}")))?;
+    let meta = toml::to_string(&table).map_err(|e| Err::Io(format!("frontmatter: {e}")))?;
+    Ok(format!("+++\n{meta}+++\n\n{}\n", c.body.trim_end()))
 }
 
 /// Parse a card file. The id is always the file name, whatever the frontmatter says.
 pub fn parse(text: &str, column: &str, stem: &str) -> Card {
+    let ver = ver_of(text);
     let t = text.replace("\r\n", "\n");
+    let mut malformed = false;
     let (mut meta, body) = match t.strip_prefix("+++\n") {
         Some(rest) => {
             let split = if let Some(after) = rest.strip_prefix("+++") {
@@ -91,10 +114,16 @@ pub fn parse(text: &str, column: &str, stem: &str) -> Card {
             };
             match split {
                 Some((m, after)) => (
-                    toml::from_str::<Meta>(m).unwrap_or_default(),
+                    toml::from_str::<Meta>(m).unwrap_or_else(|_| {
+                        malformed = true;
+                        Meta::default()
+                    }),
                     after.trim_start_matches('\n').trim_end().to_owned(),
                 ),
-                None => (Meta::default(), t.trim_end().to_owned()),
+                None => {
+                    malformed = true;
+                    (Meta::default(), t.trim_end().to_owned())
+                }
             }
         }
         None => (Meta::default(), t.trim_end().to_owned()),
@@ -110,6 +139,8 @@ pub fn parse(text: &str, column: &str, stem: &str) -> Card {
         meta,
         body,
         column: column.to_owned(),
+        ver,
+        malformed,
     }
 }
 
@@ -178,7 +209,8 @@ fn read_card(path: &Path, column: &str) -> Option<Card> {
     if stem.starts_with('.') || path.extension()? != "md" {
         return None;
     }
-    Some(parse(&fs::read_to_string(path).ok()?, column, stem))
+    let text = String::from_utf8_lossy(&fs::read(path).ok()?).into_owned();
+    Some(parse(&text, column, stem))
 }
 
 pub fn list(root: &Path, cols: &[String]) -> Vec<Card> {
@@ -223,7 +255,7 @@ pub fn create(root: &Path, cols: &[String], n: NewCard) -> Result<Card, Err> {
     let col = check_col(cols, n.column.as_deref().unwrap_or(&cols[0]))?;
     let now = now_secs();
     let id = make_id(now, &rand_hex(4), title);
-    let card = Card {
+    let mut card = Card {
         meta: Meta {
             id: id.clone(),
             title: title.to_owned(),
@@ -235,6 +267,8 @@ pub fn create(root: &Path, cols: &[String], n: NewCard) -> Result<Card, Err> {
         },
         body: n.body.trim_end().to_owned(),
         column: col.to_owned(),
+        ver: String::new(),
+        malformed: false,
     };
     let cdir = dir(root).join(col);
     fs::create_dir_all(&cdir)?;
@@ -247,13 +281,32 @@ pub fn create(root: &Path, cols: &[String], n: NewCard) -> Result<Card, Err> {
     if !marker.exists() {
         let _ = fs::write(&marker, "");
     }
-    atomic_write(&cdir.join(format!("{id}.md")), &render(&card))?;
+    let text = render(&card)?;
+    atomic_write(&cdir.join(format!("{id}.md")), &text)?;
+    card.ver = ver_of(&text);
     Ok(card)
 }
 
-fn expect_rev(card: Card, rev: u64) -> Result<Card, Err> {
-    if card.meta.rev == rev {
-        Ok(card)
+/// The caller's view must match the file: same rev, same bytes (when it sent `ver`).
+fn check(card: &Card, rev: u64, ver: Option<&str>) -> Result<(), Err> {
+    if card.malformed {
+        return Err(Err::BadRequest(
+            "card frontmatter is malformed; fix the file by hand".into(),
+        ));
+    }
+    if card.meta.rev != rev || ver.is_some_and(|v| v != card.ver) {
+        return Err(Err::Conflict(Box::new(card.clone())));
+    }
+    Ok(())
+}
+
+/// Re-read right before writing: a hand edit since `seen` was read is a conflict.
+fn unchanged(path: &Path, seen: &Card) -> Result<(), Err> {
+    let Some(card) = read_card(path, &seen.column) else {
+        return Err(Err::NotFound);
+    };
+    if card.ver == seen.ver {
+        Ok(())
     } else {
         Err(Err::Conflict(Box::new(card)))
     }
@@ -281,31 +334,56 @@ fn apply(c: &mut Card, p: Patch) -> Result<(), Err> {
     Ok(())
 }
 
-pub fn update(root: &Path, cols: &[String], id: &str, rev: u64, p: Patch) -> Result<Card, Err> {
+pub fn update(
+    root: &Path,
+    cols: &[String],
+    id: &str,
+    rev: u64,
+    ver: Option<&str>,
+    p: Patch,
+) -> Result<Card, Err> {
     let (path, card) = find(root, cols, id).ok_or(Err::NotFound)?;
-    let mut card = expect_rev(card, rev)?;
-    apply(&mut card, p)?;
-    card.meta.rev += 1;
-    card.meta.updated = iso(now_secs());
-    atomic_write(&path, &render(&card))?;
-    Ok(card)
+    check(&card, rev, ver)?;
+    let mut next = card.clone();
+    apply(&mut next, p)?;
+    next.meta.rev += 1;
+    next.meta.updated = iso(now_secs());
+    let text = render(&next)?;
+    unchanged(&path, &card)?;
+    atomic_write(&path, &text)?;
+    next.ver = ver_of(&text);
+    Ok(next)
 }
 
-pub fn move_card(root: &Path, cols: &[String], id: &str, rev: u64, to: &str) -> Result<Card, Err> {
+pub fn move_card(
+    root: &Path,
+    cols: &[String],
+    id: &str,
+    rev: u64,
+    ver: Option<&str>,
+    to: &str,
+) -> Result<Card, Err> {
     let to = check_col(cols, to)?;
     let (path, card) = find(root, cols, id).ok_or(Err::NotFound)?;
-    let mut card = expect_rev(card, rev)?;
+    check(&card, rev, ver)?;
     if card.column == to {
         return Ok(card);
     }
-    card.meta.rev += 1;
-    card.meta.updated = iso(now_secs());
-    atomic_write(&path, &render(&card))?;
-    let dest_dir = dir(root).join(to);
-    fs::create_dir_all(&dest_dir)?;
-    fs::rename(&path, dest_dir.join(format!("{id}.md")))?;
-    card.column = to.to_owned();
-    Ok(card)
+    let dest = dir(root).join(to).join(format!("{id}.md"));
+    if let Some(other) = read_card(&dest, to) {
+        return Err(Err::Duplicate(Box::new(other)));
+    }
+    let mut next = card.clone();
+    next.meta.rev += 1;
+    next.meta.updated = iso(now_secs());
+    let text = render(&next)?;
+    unchanged(&path, &card)?;
+    atomic_write(&path, &text)?;
+    fs::create_dir_all(dir(root).join(to))?;
+    fs::rename(&path, &dest)?;
+    next.column = to.to_owned();
+    next.ver = ver_of(&text);
+    Ok(next)
 }
 
 // ---- claims ----
@@ -446,11 +524,17 @@ mod tests {
                 owner: "sess".into(),
                 created: "2026-01-01T00:00:00Z".into(),
                 updated: "2026-01-02T00:00:00Z".into(),
+                extra: toml::Table::new(),
             },
             body: "Body\n\n- item\n+++ not a fence".into(),
             column: "ready".into(),
+            ver: String::new(),
+            malformed: false,
         };
-        let back = parse(&render(&c), "ready", "20260101-abcd-x");
+        let text = render(&c).unwrap();
+        let mut back = parse(&text, "ready", "20260101-abcd-x");
+        assert_eq!(back.ver, ver_of(&text));
+        back.ver.clear();
         assert_eq!(back, c);
     }
 
@@ -491,6 +575,7 @@ mod tests {
             &cols(),
             &id,
             1,
+            None,
             Patch {
                 title: Some("Renamed".into()),
                 ..Patch::default()
@@ -499,20 +584,20 @@ mod tests {
         .unwrap();
         assert_eq!(u.meta.rev, 2);
         // Stale rev: conflict carries the current card.
-        match update(&root, &cols(), &id, 1, Patch::default()) {
+        match update(&root, &cols(), &id, 1, None, Patch::default()) {
             Err(Err::Conflict(cur)) => assert_eq!(cur.meta.title, "Renamed"),
             other => panic!("expected conflict, got {other:?}"),
         }
         assert!(matches!(
-            move_card(&root, &cols(), &id, 1, "done"),
+            move_card(&root, &cols(), &id, 1, None, "done"),
             Err(Err::Conflict(_))
         ));
-        let m = move_card(&root, &cols(), &id, 2, "done").unwrap();
+        let m = move_card(&root, &cols(), &id, 2, None, "done").unwrap();
         assert_eq!((m.column.as_str(), m.meta.rev), ("done", 3));
         assert!(dir(&root).join("done").join(format!("{id}.md")).exists());
         assert!(!dir(&root).join("backlog").join(format!("{id}.md")).exists());
         assert!(matches!(
-            move_card(&root, &cols(), &id, 3, "nope"),
+            move_card(&root, &cols(), &id, 3, None, "nope"),
             Err(Err::BadRequest(_))
         ));
         assert_eq!(list(&root, &cols()).len(), 1);
@@ -520,6 +605,103 @@ mod tests {
             fs::read_to_string(dir(&root).join(".gitignore")).unwrap(),
             ".locks/\n"
         );
+    }
+
+    #[test]
+    fn hand_edit_gives_conflict() {
+        let root = tmp("ver");
+        let c = create(&root, &cols(), new("Card")).unwrap();
+        let id = c.meta.id.clone();
+        let path = dir(&root).join("backlog").join(format!("{id}.md"));
+        // Same rev, same ver: fine.
+        let u = update(&root, &cols(), &id, 1, Some(&c.ver), Patch::default()).unwrap();
+        // A hand edit that leaves rev alone.
+        let text = fs::read_to_string(&path)
+            .unwrap()
+            .replace("line one", "edited by hand");
+        fs::write(&path, text).unwrap();
+        match update(&root, &cols(), &id, 2, Some(&u.ver), Patch::default()) {
+            Err(Err::Conflict(cur)) => assert!(cur.body.contains("edited by hand")),
+            other => panic!("expected conflict, got {other:?}"),
+        }
+        assert!(matches!(
+            move_card(&root, &cols(), &id, 2, Some(&u.ver), "done"),
+            Err(Err::Conflict(_))
+        ));
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("edited by hand")
+        );
+    }
+
+    #[test]
+    fn unknown_keys_survive_rewrite() {
+        let root = tmp("extra");
+        let c = create(&root, &cols(), new("Card")).unwrap();
+        let id = c.meta.id.clone();
+        let path = dir(&root).join("backlog").join(format!("{id}.md"));
+        let text = fs::read_to_string(&path).unwrap().replacen(
+            "+++\n\n",
+            "estimate = 5\n[links]\nissue = \"#12\"\n+++\n\n",
+            1,
+        );
+        fs::write(&path, text).unwrap();
+        let cur = find(&root, &cols(), &id).unwrap().1;
+        assert!(!cur.malformed);
+        update(
+            &root,
+            &cols(),
+            &id,
+            1,
+            Some(&cur.ver),
+            Patch {
+                title: Some("T2".into()),
+                ..Patch::default()
+            },
+        )
+        .unwrap();
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("estimate = 5") && after.contains("issue = \"#12\""),
+            "{after}"
+        );
+        assert!(after.contains("T2"));
+    }
+
+    #[test]
+    fn malformed_frontmatter_refuses_writes() {
+        let root = tmp("bad");
+        let c = create(&root, &cols(), new("Card")).unwrap();
+        let id = c.meta.id.clone();
+        let path = dir(&root).join("backlog").join(format!("{id}.md"));
+        let broken = "+++\nrev = \"oops\nid = \n+++\n\nprecious body\n";
+        fs::write(&path, broken).unwrap();
+        assert!(matches!(
+            update(&root, &cols(), &id, 1, None, Patch::default()),
+            Err(Err::BadRequest(_))
+        ));
+        assert!(matches!(
+            move_card(&root, &cols(), &id, 1, None, "done"),
+            Err(Err::BadRequest(_))
+        ));
+        assert_eq!(fs::read_to_string(&path).unwrap(), broken);
+    }
+
+    #[test]
+    fn move_into_duplicate_id_conflicts() {
+        let root = tmp("dup");
+        let c = create(&root, &cols(), new("Card")).unwrap();
+        let id = c.meta.id.clone();
+        fs::create_dir_all(dir(&root).join("done")).unwrap();
+        let dup = dir(&root).join("done").join(format!("{id}.md"));
+        fs::write(&dup, "+++\n+++\n\nthe other one\n").unwrap();
+        assert!(matches!(
+            move_card(&root, &cols(), &id, 1, None, "done"),
+            Err(Err::Duplicate(_))
+        ));
+        assert!(fs::read_to_string(&dup).unwrap().contains("the other one"));
+        assert!(dir(&root).join("backlog").join(format!("{id}.md")).exists());
     }
 
     #[test]
