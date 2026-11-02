@@ -24,22 +24,33 @@ fn http(port: u16, method: &str, path: &str, token: &str, host: &str, body: &str
     (status, payload.to_owned())
 }
 
-/// Distinct ports for tests running in parallel (bind-0-and-release can hand out one port twice).
-fn free_port() -> u16 {
-    use std::sync::atomic::{AtomicU16, Ordering};
-    static NEXT: AtomicU16 = AtomicU16::new(0);
-    let _ = NEXT.compare_exchange(
-        0,
-        10000 + (std::process::id() % 20000) as u16,
-        Ordering::SeqCst,
-        Ordering::SeqCst,
-    );
-    loop {
-        let p = NEXT.fetch_add(1, Ordering::SeqCst);
-        if std::net::TcpListener::bind(("127.0.0.1", p)).is_ok() {
+/// Boards in tests bind port 0, so the OS picks a free port and concurrent test runs
+/// can never share one. This reads the bound port back from the board's pid file.
+fn board_port(data: &std::path::Path) -> Option<u16> {
+    std::fs::read_to_string(data.join("board.pid"))
+        .ok()?
+        .lines()
+        .nth(1)?
+        .trim()
+        .parse()
+        .ok()
+        .filter(|p| *p != 0)
+}
+
+/// Wait until the board in `data` is bound and healthy; returns its port.
+fn wait_board(data: &std::path::Path, child: &mut Child) -> u16 {
+    for _ in 0..100 {
+        if let Some(st) = child.try_wait().unwrap() {
+            panic!("board exited early: {st}");
+        }
+        if let Some(p) = board_port(data)
+            && wait_health(p)
+        {
             return p;
         }
+        std::thread::sleep(Duration::from_millis(100));
     }
+    panic!("board did not start");
 }
 
 struct Board(Child);
@@ -56,30 +67,16 @@ fn board_lifecycle_over_http() {
     let data = base.join("data");
     let project = base.join("proj");
     std::fs::create_dir_all(&project).unwrap();
-    let port = free_port();
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_brood"));
     cmd.arg("board")
         .env("BROOD_DATA_DIR", &data)
-        .env("BROOD_KANBAN_PORT", port.to_string())
+        .env("BROOD_KANBAN_PORT", "0")
         .env("XDG_CONFIG_HOME", base.join("cfg"))
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let board = Board(cmd.spawn().unwrap());
-
-    let mut up = false;
-    let mut board = board;
-    for _ in 0..100 {
-        if let Some(st) = board.0.try_wait().unwrap() {
-            panic!("board exited early: {st}");
-        }
-        if wait_health(port) {
-            up = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    assert!(up, "board did not start");
+    let mut board = Board(cmd.spawn().unwrap());
+    let port = wait_board(&data, &mut board.0);
     let token = std::fs::read_to_string(data.join("board.token")).unwrap();
     let t = token.trim();
     let h = "127.0.0.1";
@@ -95,7 +92,7 @@ fn board_lifecycle_over_http() {
     let second = Command::new(env!("CARGO_BIN_EXE_brood"))
         .arg("board")
         .env("BROOD_DATA_DIR", &data)
-        .env("BROOD_KANBAN_PORT", port.to_string())
+        .env("BROOD_KANBAN_PORT", "0")
         .env("XDG_CONFIG_HOME", base.join("cfg"))
         .status()
         .unwrap();
@@ -316,12 +313,11 @@ fn board_lifecycle_over_http() {
 fn two_starters_make_one_board() {
     let base = std::env::temp_dir().join(format!("brood-it2-{}", std::process::id()));
     let data = base.join("data");
-    let port = free_port();
     let start = || {
         Command::new(env!("CARGO_BIN_EXE_brood"))
             .arg("board")
             .env("BROOD_DATA_DIR", &data)
-            .env("BROOD_KANBAN_PORT", port.to_string())
+            .env("BROOD_KANBAN_PORT", "0")
             .env("XDG_CONFIG_HOME", base.join("cfg"))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -338,6 +334,7 @@ fn two_starters_make_one_board() {
         }
     }
     assert_eq!(running, 1, "exactly one board may run");
+    let port = board_port(&data).expect("survivor records its port");
     // The survivor answers a challenge only the token holder can answer.
     let (st, body) = http(port, "GET", "/api/health?nonce=abcd", "", "127.0.0.1", "");
     assert_eq!(st, 200);
@@ -373,34 +370,28 @@ fn raw(port: u16, req: &str) -> String {
 fn token_persists_and_cookie_logs_in() {
     let base = std::env::temp_dir().join(format!("brood-it3-{}", std::process::id()));
     let data = base.join("data");
-    let port = free_port();
     let brood = |args: &[&str]| {
         let mut c = Command::new(env!("CARGO_BIN_EXE_brood"));
         c.args(args)
             .env("BROOD_DATA_DIR", &data)
-            .env("BROOD_KANBAN_PORT", port.to_string())
+            .env("BROOD_KANBAN_PORT", "0")
             .env("XDG_CONFIG_HOME", base.join("cfg"));
         c
     };
     let start = || {
-        let b = Board(
+        let mut b = Board(
             brood(&["board"])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
                 .unwrap(),
         );
-        for _ in 0..100 {
-            if wait_health(port) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        b
+        let port = wait_board(&data, &mut b.0);
+        (b, port)
     };
     let token_file = data.join("board.token");
 
-    let b1 = start();
+    let (b1, port) = start();
     let t1 = std::fs::read_to_string(&token_file).unwrap();
     let t1 = t1.trim().to_owned();
     // First visit with ?token= sets the cookie and redirects to the bare URL.
@@ -444,12 +435,13 @@ fn token_persists_and_cookie_logs_in() {
     std::thread::sleep(Duration::from_millis(300));
 
     // A restart keeps the token.
-    let b2 = start();
+    let (b2, port2) = start();
     assert_eq!(std::fs::read_to_string(&token_file).unwrap().trim(), t1);
+    // --url names the port the running board actually bound.
     let out = brood(&["board", "--url"]).output().unwrap();
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
-        format!("http://127.0.0.1:{port}/?token={t1}")
+        format!("http://127.0.0.1:{port2}/?token={t1}")
     );
     drop(b2);
 

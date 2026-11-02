@@ -33,6 +33,15 @@ fn pid_path() -> PathBuf {
     state::root().join("board.pid")
 }
 
+/// Port of the running board from its pid file, else the configured port.
+fn running_port(cfg: &Config) -> u16 {
+    std::fs::read_to_string(pid_path())
+        .ok()
+        .and_then(|s| s.lines().nth(1)?.trim().parse().ok())
+        .filter(|p| *p != 0)
+        .unwrap_or(cfg.kanban_port)
+}
+
 /// Take the board's OS lock. None: another board holds it.
 pub fn acquire_lock(path: &std::path::Path) -> std::io::Result<Option<File>> {
     let f = OpenOptions::new()
@@ -1032,7 +1041,7 @@ pub fn run(cfg: &Config, ensure: bool, detach: bool, rotate: bool, url: bool) ->
             eprintln!("token rotated; open the board with `brood board --url`");
         }
         if url {
-            println!("http://127.0.0.1:{}/?token={t}", cfg.kanban_port);
+            println!("http://127.0.0.1:{}/?token={t}", running_port(cfg));
         }
         return 0;
     }
@@ -1068,6 +1077,7 @@ pub fn run(cfg: &Config, ensure: bool, detach: bool, rotate: bool, url: bool) ->
             return 1;
         }
     };
+    let _ = std::fs::remove_file(pid_path()); // we hold the lock; any pid file is stale
     let token = match token_from(&client::token_path(), false) {
         Ok(t) => t,
         Err(e) => {
@@ -1085,7 +1095,9 @@ pub fn run(cfg: &Config, ensure: bool, detach: bool, rotate: bool, url: bool) ->
             return 1;
         }
     };
-    let _ = std::fs::write(pid_path(), format!("{}\n{port}\n", std::process::id()));
+    // Record the bound port (differs from `port` when it is 0, as in tests).
+    let bound = listener.local_addr().map(|a| a.port()).unwrap_or(port);
+    let _ = std::fs::write(pid_path(), format!("{}\n{bound}\n", std::process::id()));
 
     let mut inner: Inner = std::fs::read_to_string(state_path())
         .ok()
