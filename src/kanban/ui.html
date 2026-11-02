@@ -21,6 +21,15 @@ button{cursor:pointer}button.pri{background:var(--acc);color:#fff;border-color:v
 .cards{flex:1;overflow-y:auto;padding:0 8px 8px;display:flex;flex-direction:column;gap:6px}
 .card{background:var(--card);border:1px solid var(--bd);border-radius:5px;padding:7px 9px;cursor:pointer}
 .card .t{font-weight:600}.card .m{color:var(--mut);font-size:12px;margin-top:3px}
+.card{position:relative}
+.card .go{position:absolute;top:4px;right:4px;padding:0 6px;line-height:20px;font-size:12px}
+.card .go:disabled{opacity:.45;cursor:not-allowed}
+.card .t{padding-right:28px}
+.badge{border:1px solid var(--acc);color:var(--acc);border-radius:9px;padding:0 6px;margin-right:3px}
+#pop{position:absolute;z-index:20;background:var(--card);color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:4px;display:flex;flex-direction:column;gap:2px;min-width:160px;box-shadow:0 4px 14px #0004}
+#pop button{text-align:left;border:0;background:transparent}
+#pop button:hover,#pop button:focus-visible{background:var(--col);outline:2px solid var(--acc)}
+.go:focus-visible{outline:2px solid var(--acc)}
 .tag{border:1px solid var(--bd);border-radius:9px;padding:0 6px;margin-right:3px}
 dialog{background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:8px;width:min(640px,94vw)}
 dialog::backdrop{background:#0006}
@@ -59,6 +68,7 @@ dialog input,dialog textarea{width:100%;margin:4px 0 10px}dialog textarea{height
 const token = new URLSearchParams(location.search).get("token") || "";
 const $ = id => document.getElementById(id);
 let projects = [], columns = [], cards = [], project = localStorage.getItem("brood-project") || "", editing = null;
+const sentTo = new Map();
 
 async function api(method, path, body) {
   const r = await fetch(path, {method, headers: token ? {"X-Brood-Token": token, "Content-Type": "application/json"} : {"Content-Type": "application/json"}, body: body ? JSON.stringify(body) : undefined});
@@ -97,7 +107,15 @@ function render() {
     const box = el.querySelector(".cards");
     for (const c of list) {
       const d = document.createElement("div"); d.className = "card"; d.draggable = true;
-      d.innerHTML = `<div class="t">${esc(c.title)}</div><div class="m">${c.tags.map(t => `<span class="tag">${esc(t)}</span>`).join("")}${c.priority !== "normal" ? esc(c.priority) + " " : ""}${c.owner ? "claimed " + esc(c.owner.slice(0, 8)) : ""}</div>`;
+      d.innerHTML = `<div class="t">${esc(c.title)}</div><div class="m">${c.tags.map(t => `<span class="tag">${esc(t)}</span>`).join("")}${c.priority !== "normal" ? esc(c.priority) + " " : ""}${c.owner ? "claimed " + esc(c.owner.slice(0, 8)) : sentTo.has(c.id) ? `<span class="badge">sent ${esc(sentTo.get(c.id))}</span>` : ""}</div><button type="button" class="go" draggable="false" aria-label="Send to session" title="Send to session">&#10148;</button>`;
+      const go = d.querySelector(".go");
+      const pj = projects.find(x => x.id === project);
+      if (pj && pj.sessions === 0) { go.disabled = true; go.title = "no live session"; }
+      go.onmousedown = e => e.stopPropagation();
+      go.ondragstart = e => { e.preventDefault(); e.stopPropagation(); };
+      go.onclick = e => { e.stopPropagation(); e.preventDefault(); openPop(go, c); };
+      go.onkeydown = e => e.stopPropagation();
+      if (c.owner) sentTo.delete(c.id);
       d.ondragstart = e => e.dataTransfer.setData("text/plain", c.id);
       d.onclick = () => openCard(c);
       box.appendChild(d);
@@ -117,13 +135,43 @@ function render() {
   }
 }
 
+async function liveSessions() {
+  const s = await api("GET", `/api/projects/${project}/sessions`);
+  return s.status === 200 ? s.data.sessions : [];
+}
+async function sendCard(cardId, session) {
+  const r = await api("POST", `/api/projects/${project}/cards/${cardId}/send`, {session});
+  const ok = r.status === 200;
+  note(ok ? "queued for session " + session.slice(0, 8) : (r.data && r.data.error || "send failed"));
+  if (ok) { sentTo.set(cardId, session.slice(0, 8)); render(); }
+  return ok;
+}
+function closePop() { const p = $("pop"); if (p) { const b = p._btn; p.remove(); if (b && b.isConnected) b.focus(); } }
+async function openPop(btn, c) {
+  const had = $("pop") && $("pop")._btn === btn; closePop(); if (had) return;
+  const list = await liveSessions();
+  if (!list.length) { btn.disabled = true; btn.title = "no live session"; note("no live session"); return; }
+  const p = document.createElement("div"); p.id = "pop"; p.setAttribute("role", "menu"); p._btn = btn;
+  p.innerHTML = list.map(x => `<button type="button" role="menuitem" data-s="${esc(x.session)}">${esc(x.session.slice(0, 8))} ${esc(x.cwd.split(/[\\/]/).pop())}</button>`).join("");
+  const r = btn.getBoundingClientRect();
+  p.style.top = (r.bottom + window.scrollY + 2) + "px"; p.style.left = Math.max(4, r.right + window.scrollX - 170) + "px";
+  p.onclick = async e => { const b = e.target.closest("button"); if (!b) return; e.stopPropagation(); const id = b.dataset.s; closePop(); await sendCard(c.id, id); };
+  p.onkeydown = e => {
+    const items = [...p.querySelectorAll("button")], i = items.indexOf(document.activeElement);
+    if (e.key === "Escape") { e.preventDefault(); closePop(); }
+    else if (e.key === "ArrowDown") { e.preventDefault(); items[(i + 1) % items.length].focus(); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); items[(i - 1 + items.length) % items.length].focus(); }
+  };
+  document.body.appendChild(p); p.querySelector("button").focus();
+}
+document.addEventListener("click", e => { if ($("pop") && !e.target.closest("#pop,.go")) closePop(); });
+
 async function openCard(c) {
   editing = c;
   $("f-title").value = c.title; $("f-body").value = c.body; $("f-prio").value = c.priority; $("f-tags").value = c.tags.join(", ");
   $("f-info").textContent = `${c.id}  rev ${c.rev}  updated ${c.updated}`;
   $("send").style.display = $("f-sess").style.display = "";
-  const s = await api("GET", `/api/projects/${project}/sessions`);
-  const list = s.status === 200 ? s.data.sessions : [];
+  const list = await liveSessions();
   $("f-sess").innerHTML = list.length ? list.map(x => `<option value="${esc(x.session)}">${esc(x.session.slice(0, 8))} ${esc(x.cwd.split(/[\\/]/).pop())}</option>`).join("") : `<option value="">no live sessions</option>`;
   $("dlg").showModal();
 }
@@ -149,8 +197,7 @@ $("save").onclick = async () => {
 $("send").onclick = async () => {
   const session = $("f-sess").value;
   if (!session || !editing) { note("no session to send to"); return; }
-  const r = await api("POST", `/api/projects/${project}/cards/${editing.id}/send`, {session});
-  note(r.status === 200 ? "queued for session " + session.slice(0, 8) : (r.data && r.data.error || "send failed"));
+  await sendCard(editing.id, session);
 };
 $("proj").onchange = () => { project = $("proj").value; localStorage.setItem("brood-project", project); loadCards(); };
 
