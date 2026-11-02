@@ -105,6 +105,9 @@ pub struct Sent {
     pub project: String,
     pub title: String,
     pub body: String,
+    /// The card's review decision when it was sent.
+    #[serde(default)]
+    pub decision: String,
     pub at: u64,
     /// When the push transport got it (0 = not pushed). It stays queued until the card is claimed.
     #[serde(default)]
@@ -753,6 +756,7 @@ fn route(sh: &Arc<Shared>, req: &Req, body: &Value) -> (u16, Value) {
             let patch = Patch {
                 title: s(body, "title"),
                 body: s(body, "body"),
+                decision: s(body, "decision"),
                 priority: s(body, "priority"),
                 tags: tags_of(&body["tags"]),
                 owner: None,
@@ -877,6 +881,7 @@ fn route(sh: &Arc<Shared>, req: &Req, body: &Value) -> (u16, Value) {
                 project: (*p).to_owned(),
                 title: card.meta.title,
                 body: card.body,
+                decision: card.decision,
                 at: now_secs(),
                 pushed: 0,
             };
@@ -1218,6 +1223,7 @@ mod tests {
             project: "p".into(),
             title: "t".into(),
             body: "b".into(),
+            decision: String::new(),
             at: 0,
             pushed: 0,
         }

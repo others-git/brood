@@ -839,7 +839,7 @@ fn main_stop(cfg: &config::Config, session: &str) -> Option<Value> {
 
 fn sent_card_text(c: &Value) -> String {
     let g = |k: &str| c[k].as_str().unwrap_or_default();
-    kanban::frame_card(g("card"), g("title"), g("body"))
+    kanban::frame_card(g("card"), g("title"), g("body"), g("decision"))
 }
 
 fn session_end(cfg: &config::Config, session: &str) -> Option<Value> {

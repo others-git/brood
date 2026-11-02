@@ -50,6 +50,7 @@ dialog input,dialog textarea{width:100%;margin:4px 0 10px}dialog textarea{height
   <form method="dialog" id="form">
     <label>Title<input id="f-title"></label>
     <label>Description<textarea id="f-body"></textarea></label>
+    <label id="l-dec">Decision<textarea id="f-dec" placeholder="Review decision, e.g. approved, merge it"></textarea></label>
     <div class="row">
       <label>Priority <select id="f-prio"><option>low</option><option>normal</option><option>high</option></select></label>
       <label>Tags <input id="f-tags" style="width:200px;margin:0" placeholder="comma separated"></label>
@@ -70,7 +71,7 @@ const token = new URLSearchParams(location.search).get("token") || "";
 const $ = id => document.getElementById(id);
 let projects = [], columns = [], cards = [], project = localStorage.getItem("brood-project") || "", editing = null;
 const sentTo = new Map();
-const NO_SEND = ["review", "done"]; // work is finished there: nothing to send
+const NO_SEND = ["done"]; // work is finished there: nothing to send
 
 async function api(method, path, body) {
   const r = await fetch(path, {method, headers: token ? {"X-Brood-Token": token, "Content-Type": "application/json"} : {"Content-Type": "application/json"}, body: body ? JSON.stringify(body) : undefined});
@@ -109,7 +110,7 @@ function render() {
     const box = el.querySelector(".cards");
     for (const c of list) {
       const d = document.createElement("div"); d.className = "card"; d.draggable = true;
-      d.innerHTML = `<div class="t">${esc(c.title)}</div><div class="m">${c.tags.map(t => `<span class="tag">${esc(t)}</span>`).join("")}${c.priority !== "normal" ? esc(c.priority) + " " : ""}${c.owner ? `<span class="badge claimed" title="claimed by session ${esc(c.owner)}">claimed ${esc(c.owner.slice(0, 8))}</span>` : sentTo.has(c.id) ? `<span class="badge">sent ${esc(sentTo.get(c.id))}</span>` : ""}</div>${NO_SEND.includes(c.column) ? "" : `<button type="button" class="go" draggable="false" aria-label="Send to session" title="Send to session">&#10148;</button>`}`;
+      d.innerHTML = `<div class="t">${esc(c.title)}</div><div class="m">${c.column === "review" && c.decision ? `<span class="badge" title="has a review decision">decision</span>` : ""}${c.tags.map(t => `<span class="tag">${esc(t)}</span>`).join("")}${c.priority !== "normal" ? esc(c.priority) + " " : ""}${c.owner ? `<span class="badge claimed" title="claimed by session ${esc(c.owner)}">claimed ${esc(c.owner.slice(0, 8))}</span>` : sentTo.has(c.id) ? `<span class="badge">sent ${esc(sentTo.get(c.id))}</span>` : ""}</div>${NO_SEND.includes(c.column) ? "" : `<button type="button" class="go" draggable="false" aria-label="Send to session" title="Send to session">&#10148;</button>`}`;
       const go = d.querySelector(".go");
       if (go) {
       const pj = projects.find(x => x.id === project);
@@ -173,6 +174,8 @@ document.addEventListener("click", e => { if ($("pop") && !e.target.closest("#po
 async function openCard(c) {
   editing = c;
   $("f-title").value = c.title; $("f-body").value = c.body; $("f-prio").value = c.priority; $("f-tags").value = c.tags.join(", ");
+  $("f-dec").value = c.decision || ""; $("f-dec").readOnly = c.column !== "review";
+  $("l-dec").style.display = c.column === "review" || c.decision ? "" : "none";
   $("f-info").textContent = `${c.id}  rev ${c.rev}  updated ${c.updated}` + (c.owner ? `  claimed by ${c.owner.slice(0, 8)}` : "");
   $("send").style.display = $("f-sess").style.display = NO_SEND.includes(c.column) ? "none" : "";
   const list = await liveSessions();
@@ -181,7 +184,7 @@ async function openCard(c) {
 }
 $("new").onclick = () => {
   editing = null;
-  $("f-title").value = ""; $("f-body").value = ""; $("f-prio").value = "normal"; $("f-tags").value = "";
+  $("f-title").value = ""; $("f-body").value = ""; $("f-dec").value = ""; $("l-dec").style.display = "none"; $("f-prio").value = "normal"; $("f-tags").value = "";
   $("f-info").textContent = "New card in " + columns[0];
   $("send").style.display = $("f-sess").style.display = "none";
   $("dlg").showModal();
@@ -192,6 +195,7 @@ $("save").onclick = async () => {
     tags: $("f-tags").value.split(",").map(t => t.trim()).filter(Boolean)};
   if (!body.title.trim()) { note("title required"); return; }
   let r;
+  if (editing && editing.column === "review") body.decision = $("f-dec").value;
   if (editing) r = await api("PATCH", `/api/projects/${project}/cards/${editing.id}`, {...body, rev: editing.rev, ver: editing.ver});
   else r = await api("POST", `/api/projects/${project}/cards`, body);
   if (r.status === 409) note("changed elsewhere, reloaded");

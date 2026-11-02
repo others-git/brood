@@ -29,7 +29,7 @@ pub fn tools() -> Value {
     json!([
         {
             "name": "kanban_list",
-            "description": "List kanban cards of this project (id, title, column, rev, priority, tags, owner, body). Optional column filter or single card id.",
+            "description": "List kanban cards of this project (id, title, column, rev, priority, tags, owner, body, decision). Optional column filter or single card id.",
             "inputSchema": {"type": "object", "properties": {
                 "column": {"type": "string"}, "id": {"type": "string"}}}
         },
@@ -48,6 +48,7 @@ pub fn tools() -> Value {
             "inputSchema": {"type": "object", "required": ["id", "rev", "ver"], "properties": {
                 "id": {"type": "string"}, "rev": {"type": "integer"}, "ver": {"type": "string"},
                 "title": {"type": "string"}, "body": {"type": "string"},
+                "decision": {"type": "string", "description": "The user's review decision on the card."},
                 "priority": {"type": "string"}, "tags": {"type": "array", "items": {"type": "string"}},
                 "column": {"type": "string"}}}
         },
@@ -85,7 +86,7 @@ pub fn channel_notification(card: &Value) -> Value {
     let g = |k: &str| card[k].as_str().unwrap_or_default();
     let content = format!(
         "{CARD_NOTICE}\n\n{}\n\nClaim it first (kanban_claim), work it, then move it to review.",
-        frame_card(g("card"), g("title"), g("body"))
+        frame_card(g("card"), g("title"), g("body"), g("decision"))
     );
     json!({
         "jsonrpc": "2.0",
@@ -226,7 +227,7 @@ pub fn call_tool(cfg: &Config, name: &str, args: &Value) -> Result<String, Strin
                 o.remove("id");
                 o.remove("column");
             }
-            let has_fields = ["title", "body", "priority", "tags"]
+            let has_fields = ["title", "body", "decision", "priority", "tags"]
                 .iter()
                 .any(|k| !args[k].is_null());
             let mut card = Value::Null;
@@ -392,7 +393,7 @@ mod tests {
     #[test]
     fn channel_notification_shape() {
         let n = channel_notification(
-            &json!({"card": "20260101-abcd-x", "project": "p1", "title": "Do it", "body": "details"}),
+            &json!({"card": "20260101-abcd-x", "project": "p1", "title": "Do it", "body": "details", "decision": "ship it"}),
         );
         assert_eq!(n["method"], "notifications/claude/channel");
         assert!(n.get("id").is_none());
@@ -400,6 +401,7 @@ mod tests {
         assert!(
             content.contains("Do it")
                 && content.contains("details")
+                && content.contains("ship it")
                 && content.contains("20260101-abcd-x")
         );
         for k in n["params"]["meta"].as_object().unwrap().keys() {

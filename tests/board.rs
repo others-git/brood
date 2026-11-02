@@ -354,6 +354,45 @@ fn board_lifecycle_over_http() {
     );
     assert_eq!(st, 200);
 
+    // Decision: PATCH sets it, a tricky body survives, a stale ver is a 409.
+    let (st, b) = http(
+        port,
+        "POST",
+        &format!("/api/projects/{pid}/cards"),
+        t,
+        h,
+        r###"{"title":"Dec card","body":"intro\n## Decision\nnot a verdict","column":"review"}"###,
+    );
+    assert_eq!(st, 201, "{b}");
+    let dc: serde_json::Value = serde_json::from_str(&b).unwrap();
+    let did = dc["id"].as_str().unwrap().to_owned();
+    assert_eq!(dc["decision"], "");
+    let dver = dc["ver"].as_str().unwrap().to_owned();
+    let (st, b) = http(
+        port,
+        "PATCH",
+        &format!("/api/projects/{pid}/cards/{did}"),
+        t,
+        h,
+        &format!(r#"{{"rev":1,"ver":"{dver}","decision":"approved\n## Decision\nmerge it"}}"#),
+    );
+    assert_eq!(st, 200, "{b}");
+    let dc: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert_eq!(dc["decision"], "approved\n## Decision\nmerge it");
+    assert_eq!(dc["body"], "intro\n## Decision\nnot a verdict");
+    let (st, b) = http(
+        port,
+        "PATCH",
+        &format!("/api/projects/{pid}/cards/{did}"),
+        t,
+        h,
+        &format!(r#"{{"rev":2,"ver":"{dver}","decision":"stale"}}"#),
+    );
+    assert_eq!(st, 409, "{b}");
+    let (st, b) = http(port, "GET", &format!("/api/projects/{pid}/cards"), t, h, "");
+    assert_eq!(st, 200, "{b}");
+    assert!(b.contains("approved\\n## Decision\\nmerge it"), "{b}");
+
     // Shut down over the API.
     assert_eq!(http(port, "POST", "/api/shutdown", t, h, "").0, 200);
     let mut board = board;

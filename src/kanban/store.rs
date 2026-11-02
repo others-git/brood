@@ -47,6 +47,8 @@ pub struct Card {
     #[serde(flatten)]
     pub meta: Meta,
     pub body: String,
+    /// The user's review decision: a trailing `## Decision` section in the file.
+    pub decision: String,
     pub column: String,
     /// Hash of the raw file bytes. A writer sends it back; a mismatch means the file changed.
     pub ver: String,
@@ -75,6 +77,7 @@ impl From<std::io::Error> for Err {
 pub struct Patch {
     pub title: Option<String>,
     pub body: Option<String>,
+    pub decision: Option<String>,
     pub priority: Option<String>,
     pub tags: Option<Vec<String>>,
     pub owner: Option<String>,
@@ -97,7 +100,57 @@ pub fn ver_of(text: &str) -> String {
 pub fn render(c: &Card) -> Result<String, Err> {
     let table = toml::Value::try_from(&c.meta).map_err(|e| Err::Io(format!("frontmatter: {e}")))?;
     let meta = toml::to_string(&table).map_err(|e| Err::Io(format!("frontmatter: {e}")))?;
-    Ok(format!("+++\n{meta}+++\n\n{}\n", c.body.trim_end()))
+    let body = escape_marker(c.body.trim_end());
+    let dec = c.decision.trim();
+    if dec.is_empty() {
+        Ok(format!("+++\n{meta}+++\n\n{body}\n"))
+    } else {
+        Ok(format!(
+            "+++\n{meta}+++\n\n{body}\n\n{DECISION_MARK}\n\n{}\n",
+            escape_marker(dec)
+        ))
+    }
+}
+
+const DECISION_MARK: &str = "## Decision";
+
+/// A line that is `## Decision` (after any leading backslashes) gets one more backslash,
+/// so only a real section marker is ever a bare `## Decision` line.
+fn escape_marker(s: &str) -> String {
+    s.split('\n')
+        .map(|l| {
+            if l.trim_start_matches('\\') == DECISION_MARK {
+                format!("\\{l}")
+            } else {
+                l.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn unescape_marker(s: &str) -> String {
+    s.split('\n')
+        .map(|l| match l.strip_prefix('\\') {
+            Some(r) if r.trim_start_matches('\\') == DECISION_MARK => r,
+            _ => l,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Split a body into (description, decision) at the first bare `## Decision` line.
+fn split_decision(body: &str) -> (String, String) {
+    let mut off = 0;
+    for l in body.split('\n') {
+        if l == DECISION_MARK {
+            let desc = body[..off].trim_end();
+            let dec = body[off + l.len()..].trim();
+            return (unescape_marker(desc), unescape_marker(dec));
+        }
+        off += l.len() + 1;
+    }
+    (unescape_marker(body), String::new())
 }
 
 /// Parse a card file. The id is always the file name, whatever the frontmatter says.
@@ -128,6 +181,7 @@ pub fn parse(text: &str, column: &str, stem: &str) -> Card {
         }
         None => (Meta::default(), t.trim_end().to_owned()),
     };
+    let (body, decision) = split_decision(&body);
     meta.id = stem.to_owned();
     if meta.title.is_empty() {
         meta.title = stem.to_owned();
@@ -138,6 +192,7 @@ pub fn parse(text: &str, column: &str, stem: &str) -> Card {
     Card {
         meta,
         body,
+        decision,
         column: column.to_owned(),
         ver,
         malformed,
@@ -266,6 +321,7 @@ pub fn create(root: &Path, cols: &[String], n: NewCard) -> Result<Card, Err> {
             ..Meta::default()
         },
         body: n.body.trim_end().to_owned(),
+        decision: String::new(),
         column: col.to_owned(),
         ver: String::new(),
         malformed: false,
@@ -321,6 +377,9 @@ fn apply(c: &mut Card, p: Patch) -> Result<(), Err> {
     }
     if let Some(b) = p.body {
         c.body = b.trim_end().to_owned();
+    }
+    if let Some(d) = p.decision {
+        c.decision = d.trim().to_owned();
     }
     if let Some(x) = p.priority {
         c.meta.priority = x;
@@ -527,6 +586,7 @@ mod tests {
                 extra: toml::Table::new(),
             },
             body: "Body\n\n- item\n+++ not a fence".into(),
+            decision: String::new(),
             column: "ready".into(),
             ver: String::new(),
             malformed: false,
@@ -536,6 +596,29 @@ mod tests {
         assert_eq!(back.ver, ver_of(&text));
         back.ver.clear();
         assert_eq!(back, c);
+    }
+
+    #[test]
+    fn decision_round_trip_with_tricky_text() {
+        for (body, dec) in [
+            ("plain", "approved"),
+            ("intro\n## Decision\nfake", "ok\n## Decision\nmore"),
+            ("\\## Decision\n\\\\## Decision", "\\## Decision"),
+            ("## Decision", ""),
+            ("x\n\n## Decision\n\ny", "multi\n\nline\n\n- list"),
+        ] {
+            let mut c = parse("", "review", "a-b");
+            c.body = body.into();
+            c.decision = dec.into();
+            let text = render(&c).unwrap();
+            let back = parse(&text, "review", "a-b");
+            assert_eq!(back.body, body, "{text}");
+            assert_eq!(back.decision, dec, "{text}");
+        }
+        let mut c = parse("", "review", "a-b");
+        c.body = "d".into();
+        c.decision = "yes".into();
+        assert!(render(&c).unwrap().ends_with("d\n\n## Decision\n\nyes\n"));
     }
 
     #[test]
