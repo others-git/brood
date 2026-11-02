@@ -19,6 +19,11 @@ use std::time::{Duration, Instant};
 
 const UI: &str = include_str!("ui.html");
 const IDLE_DEFAULT_SECS: u64 = 600;
+/// Columns where a session-created card is not claimed unless asked (`claim: true`).
+const NO_CLAIM_ON_CREATE: [&str; 3] = ["backlog", "ready", "done"];
+/// Moving a card into one of these columns releases its claim.
+const RELEASE_ON_MOVE: [&str; 2] = ["backlog", "done"];
+
 /// A pushed card that is still unclaimed after this is delivered by the hooks too.
 const PUSH_GRACE_SECS: u64 = 60;
 const MAX_CONNS: usize = 64;
@@ -703,8 +708,8 @@ fn route(sh: &Arc<Shared>, req: &Req, body: &Value) -> (u16, Value) {
             let Some(title) = s(body, "title") else {
                 return err(400, "title required");
             };
-            let _g = sh.inner.lock().unwrap();
-            let r = store::create(
+            let mut g = sh.inner.lock().unwrap();
+            let mut r = store::create(
                 &root,
                 cols,
                 NewCard {
@@ -715,7 +720,27 @@ fn route(sh: &Arc<Shared>, req: &Req, body: &Value) -> (u16, Value) {
                     tags: tags_of(&body["tags"]).unwrap_or_default(),
                 },
             );
-            drop(_g);
+            // A card a session creates for work it is doing now is claimed for it, by the same
+            // lock as `claim`. Default: any column except backlog, ready and done.
+            if let (Ok(card), Some(sid)) = (&r, s(body, "session")) {
+                let want = body["claim"]
+                    .as_bool()
+                    .unwrap_or_else(|| !NO_CLAIM_ON_CREATE.contains(&card.column.as_str()));
+                if want && g.sessions.contains_key(&sid) {
+                    let id = card.meta.id.clone();
+                    let alive = |o: &str| g.sessions.contains_key(o);
+                    if store::try_lock(&root, &id, &sid, &alive).is_ok() {
+                        let patch = Patch {
+                            owner: Some(sid),
+                            ..Patch::default()
+                        };
+                        if let Ok(c) = store::update(&root, cols, &id, card.meta.rev, None, patch) {
+                            r = Ok(c);
+                        }
+                    }
+                }
+            }
+            drop(g);
             changed(sh, p, r.map(|c| (201, json!(c))))
         }
         ("PATCH", ["api", "projects", p, "cards", id]) => {
@@ -747,7 +772,21 @@ fn route(sh: &Arc<Shared>, req: &Req, body: &Value) -> (u16, Value) {
                 return err(400, "rev, ver and column required");
             };
             let _g = sh.inner.lock().unwrap();
-            let r = store::move_card(&root, cols, id, rev, Some(&ver), &col);
+            let mut r = store::move_card(&root, cols, id, rev, Some(&ver), &col);
+            // Done or back to backlog: the work is over, so the claim goes with it.
+            if let Ok(card) = &r
+                && RELEASE_ON_MOVE.contains(&col.as_str())
+                && !card.meta.owner.is_empty()
+            {
+                store::unlock(&root, id, &card.meta.owner, true);
+                let patch = Patch {
+                    owner: Some(String::new()),
+                    ..Patch::default()
+                };
+                if let Ok(c) = store::update(&root, cols, id, card.meta.rev, None, patch) {
+                    r = Ok(c);
+                }
+            }
             drop(_g);
             changed(sh, p, r.map(|c| (200, json!(c))))
         }

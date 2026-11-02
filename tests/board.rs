@@ -297,6 +297,63 @@ fn board_lifecycle_over_http() {
         0
     );
 
+    // Create-with-claim: working columns claim for the creating session, backlog does not,
+    // and moving into done releases the claim.
+    let mk = |extra: &str| {
+        let (st, b) = http(
+            port,
+            "POST",
+            &format!("/api/projects/{pid}/cards"),
+            t,
+            h,
+            &format!(r#"{{"title":"mine","session":"sess-a"{extra}}}"#),
+        );
+        assert_eq!(st, 201, "{b}");
+        serde_json::from_str::<serde_json::Value>(&b).unwrap()
+    };
+    let working = mk(r#","column":"in-progress""#);
+    assert_eq!(working["owner"], "sess-a");
+    assert_eq!(mk("")["owner"], "");
+    assert_eq!(mk(r#","column":"in-progress","claim":false"#)["owner"], "");
+    assert_eq!(mk(r#","column":"ready","claim":true"#)["owner"], "sess-a");
+    let wid = working["id"].as_str().unwrap();
+    // The lock is real: another session cannot claim it.
+    let (st, _) = http(
+        port,
+        "POST",
+        &format!("/api/projects/{pid}/cards/{wid}/claim"),
+        t,
+        h,
+        r#"{"session":"sess-b"}"#,
+    );
+    assert_eq!(st, 409);
+    let (st, b) = http(
+        port,
+        "POST",
+        &format!("/api/projects/{pid}/cards/{wid}/move"),
+        t,
+        h,
+        &format!(
+            r#"{{"rev":{},"ver":"{}","column":"done"}}"#,
+            working["rev"],
+            working["ver"].as_str().unwrap()
+        ),
+    );
+    assert_eq!(st, 200, "{b}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&b).unwrap()["owner"],
+        ""
+    );
+    let (st, _) = http(
+        port,
+        "POST",
+        &format!("/api/projects/{pid}/cards/{wid}/claim"),
+        t,
+        h,
+        r#"{"session":"sess-b"}"#,
+    );
+    assert_eq!(st, 200);
+
     // Shut down over the API.
     assert_eq!(http(port, "POST", "/api/shutdown", t, h, "").0, 200);
     let mut board = board;

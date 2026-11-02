@@ -35,11 +35,12 @@ pub fn tools() -> Value {
         },
         {
             "name": "kanban_create",
-            "description": "Create a kanban card (default column: first column).",
+            "description": "Create a kanban card (default column: first column). Claimed for this session when created in a working column such as in-progress (claim defaults to true except in backlog, ready and done).",
             "inputSchema": {"type": "object", "required": ["title"], "properties": {
                 "title": {"type": "string"}, "body": {"type": "string"},
                 "column": {"type": "string"}, "priority": {"type": "string"},
-                "tags": {"type": "array", "items": {"type": "string"}}}}
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "claim": {"type": "boolean"}}}
         },
         {
             "name": "kanban_update",
@@ -208,7 +209,14 @@ pub fn call_tool(cfg: &Config, name: &str, args: &Value) -> Result<String, Strin
                 .collect();
             json!({"columns": all["columns"], "cards": cards})
         }
-        "kanban_create" => req("POST", &format!("{base}/cards"), Some(args))?,
+        "kanban_create" => {
+            let mut body = args.clone();
+            let sid = session_id(&conn);
+            if let (Some(o), true) = (body.as_object_mut(), valid_sid(&sid)) {
+                o.insert("session".into(), json!(sid));
+            }
+            req("POST", &format!("{base}/cards"), Some(&body))?
+        }
         "kanban_update" => {
             let id = card_id(args)?;
             let mut rev = args["rev"].as_u64().ok_or("rev required")?;
