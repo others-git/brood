@@ -13,6 +13,7 @@ header{display:flex;gap:10px;align-items:center;padding:8px 12px;border-bottom:1
 header h1{font-size:15px;margin:0}
 select,input,textarea,button{font:inherit;color:inherit;background:var(--card);border:1px solid var(--bd);border-radius:4px;padding:4px 8px}
 button{cursor:pointer}button.pri{background:var(--acc);color:#fff;border-color:var(--acc)}
+#q{width:180px}
 #msg{margin-left:auto;color:var(--warn)}
 #board{flex:1;display:flex;gap:10px;padding:12px;overflow-x:auto}
 .col{flex:1 0 220px;max-width:340px;background:var(--col);border-radius:6px;display:flex;flex-direction:column;min-height:0}
@@ -43,6 +44,7 @@ dialog input,dialog textarea{width:100%;margin:4px 0 10px}dialog textarea{height
   <h1>brood board</h1>
   <select id="proj" title="Project"></select>
   <button id="new" class="pri">New card</button>
+  <input id="q" type="search" placeholder="Search  /" autocomplete="off" aria-label="Search cards" title="Search cards (/)">
   <span id="msg"></span>
 </header>
 <div id="board"></div>
@@ -71,6 +73,12 @@ const token = new URLSearchParams(location.search).get("token") || "";
 const $ = id => document.getElementById(id);
 let projects = [], columns = [], cards = [], project = localStorage.getItem("brood-project") || "", editing = null;
 const sentTo = new Map();
+let query = "";
+function matches(c) {
+  const q = query.trim().toLowerCase();
+  if (!q) return true;
+  return [c.title, c.id, (c.tags || []).join(" "), c.owner, c.body, c.decision].some(v => v && String(v).toLowerCase().includes(q));
+}
 const NO_SEND = ["done"]; // work is finished there: nothing to send
 
 async function api(method, path, body) {
@@ -105,8 +113,9 @@ function render() {
   $("board").innerHTML = "";
   for (const col of columns) {
     const el = document.createElement("section"); el.className = "col";
-    const list = cards.filter(c => c.column === col);
-    el.innerHTML = `<h2>${esc(col)} (${list.length})</h2><div class="cards"></div>`;
+    const all = cards.filter(c => c.column === col);
+    const list = all.filter(matches);
+    el.innerHTML = `<h2>${esc(col)} (${query.trim() ? list.length + "/" + all.length : list.length})</h2><div class="cards"></div>`;
     const box = el.querySelector(".cards");
     for (const c of list) {
       const d = document.createElement("div"); d.className = "card"; d.draggable = true;
@@ -217,6 +226,15 @@ function listen() {
     else if (ev.type !== "cards") loadProjects();
   };
 }
+$("q").oninput = () => { query = $("q").value; render(); };
+$("q").onkeydown = e => { if (e.key === "Escape") { e.preventDefault(); $("q").value = ""; query = ""; $("q").blur(); render(); } };
+document.addEventListener("keydown", e => {
+  if (e.key !== "/" || e.ctrlKey || e.metaKey || e.altKey || e.defaultPrevented) return;
+  const a = document.activeElement;
+  if (a && (/^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) || a.isContentEditable)) return;
+  if ($("dlg").open) return;
+  e.preventDefault(); $("q").focus(); $("q").select();
+});
 loadProjects(); listen();
 </script>
 </body>
