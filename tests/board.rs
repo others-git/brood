@@ -24,6 +24,24 @@ fn http(port: u16, method: &str, path: &str, token: &str, host: &str, body: &str
     (status, payload.to_owned())
 }
 
+/// Distinct ports for tests running in parallel (bind-0-and-release can hand out one port twice).
+fn free_port() -> u16 {
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    let _ = NEXT.compare_exchange(
+        0,
+        10000 + (std::process::id() % 20000) as u16,
+        Ordering::SeqCst,
+        Ordering::SeqCst,
+    );
+    loop {
+        let p = NEXT.fetch_add(1, Ordering::SeqCst);
+        if std::net::TcpListener::bind(("127.0.0.1", p)).is_ok() {
+            return p;
+        }
+    }
+}
+
 struct Board(Child);
 impl Drop for Board {
     fn drop(&mut self) {
@@ -38,11 +56,7 @@ fn board_lifecycle_over_http() {
     let data = base.join("data");
     let project = base.join("proj");
     std::fs::create_dir_all(&project).unwrap();
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let port = free_port();
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_brood"));
     cmd.arg("board")
@@ -54,10 +68,12 @@ fn board_lifecycle_over_http() {
     let board = Board(cmd.spawn().unwrap());
 
     let mut up = false;
+    let mut board = board;
     for _ in 0..100 {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok()
-            && http(port, "GET", "/api/health", "", "127.0.0.1", "").0 == 200
-        {
+        if let Some(st) = board.0.try_wait().unwrap() {
+            panic!("board exited early: {st}");
+        }
+        if wait_health(port) {
             up = true;
             break;
         }
@@ -300,11 +316,7 @@ fn board_lifecycle_over_http() {
 fn two_starters_make_one_board() {
     let base = std::env::temp_dir().join(format!("brood-it2-{}", std::process::id()));
     let data = base.join("data");
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let port = free_port();
     let start = || {
         Command::new(env!("CARGO_BIN_EXE_brood"))
             .arg("board")
@@ -330,4 +342,124 @@ fn two_starters_make_one_board() {
     let (st, body) = http(port, "GET", "/api/health?nonce=abcd", "", "127.0.0.1", "");
     assert_eq!(st, 200);
     assert!(body.contains("\"proof\""), "{body}");
+}
+
+/// One health probe that treats any I/O trouble as "not up yet".
+fn wait_health(port: u16) -> bool {
+    let probe = || -> std::io::Result<bool> {
+        let mut s = TcpStream::connect_timeout(
+            &SocketAddr::from(([127, 0, 0, 1], port)),
+            Duration::from_secs(1),
+        )?;
+        s.set_read_timeout(Some(Duration::from_secs(2)))?;
+        s.write_all(b"GET /api/health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")?;
+        let mut out = String::new();
+        s.read_to_string(&mut out)?;
+        Ok(out.starts_with("HTTP/1.1 200"))
+    };
+    probe().unwrap_or(false)
+}
+
+fn raw(port: u16, req: &str) -> String {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    s.write_all(req.as_bytes()).unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).unwrap();
+    out
+}
+
+#[test]
+fn token_persists_and_cookie_logs_in() {
+    let base = std::env::temp_dir().join(format!("brood-it3-{}", std::process::id()));
+    let data = base.join("data");
+    let port = free_port();
+    let brood = |args: &[&str]| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_brood"));
+        c.args(args)
+            .env("BROOD_DATA_DIR", &data)
+            .env("BROOD_KANBAN_PORT", port.to_string())
+            .env("XDG_CONFIG_HOME", base.join("cfg"));
+        c
+    };
+    let start = || {
+        let b = Board(
+            brood(&["board"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        for _ in 0..100 {
+            if wait_health(port) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        b
+    };
+    let token_file = data.join("board.token");
+
+    let b1 = start();
+    let t1 = std::fs::read_to_string(&token_file).unwrap();
+    let t1 = t1.trim().to_owned();
+    // First visit with ?token= sets the cookie and redirects to the bare URL.
+    let r = raw(
+        port,
+        &format!("GET /?token={t1} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(r.starts_with("HTTP/1.1 302"), "{r}");
+    assert!(
+        r.contains(&format!(
+            "Set-Cookie: brood_token={t1}; HttpOnly; SameSite=Strict; Path=/"
+        )),
+        "{r}"
+    );
+    assert!(r.contains("Location: /\r\n"));
+    // The cookie alone opens the page and the API; a wrong one does not.
+    let with = |c: &str, path: &str| {
+        raw(
+            port,
+            &format!(
+                "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: brood_token={c}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+    };
+    assert!(with(&t1, "/").starts_with("HTTP/1.1 200"));
+    assert!(with(&t1, "/api/projects").starts_with("HTTP/1.1 200"));
+    assert!(with("nope", "/api/projects").starts_with("HTTP/1.1 401"));
+    // A foreign Origin is refused even with the cookie.
+    let r = raw(
+        port,
+        &format!(
+            "GET /api/projects HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://evil.example\r\nCookie: brood_token={t1}\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    assert!(r.starts_with("HTTP/1.1 403"), "{r}");
+    assert_eq!(
+        http(port, "POST", "/api/shutdown", &t1, "127.0.0.1", "").0,
+        200
+    );
+    drop(b1);
+    std::thread::sleep(Duration::from_millis(300));
+
+    // A restart keeps the token.
+    let b2 = start();
+    assert_eq!(std::fs::read_to_string(&token_file).unwrap().trim(), t1);
+    let out = brood(&["board", "--url"]).output().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        format!("http://127.0.0.1:{port}/?token={t1}")
+    );
+    drop(b2);
+
+    // Rotation makes a new one.
+    assert!(
+        brood(&["board", "--rotate-token"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert_ne!(std::fs::read_to_string(&token_file).unwrap().trim(), t1);
 }

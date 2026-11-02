@@ -40,6 +40,12 @@ enum Cmd {
         /// Internal: the short-lived first stage that starts a board outside the caller's process tree.
         #[arg(long, hide = true)]
         detach: bool,
+        /// Generate a new access token (the old URL and cookies stop working).
+        #[arg(long)]
+        rotate_token: bool,
+        /// Print the board URL with its token.
+        #[arg(long)]
+        url: bool,
     },
     /// Stdio MCP server for the kanban tools (started by the plugin).
     Mcp,
@@ -85,8 +91,19 @@ fn main() {
             }
             println!("{} process(es)", killed.len());
         }
-        Cmd::Board { ensure, detach } => {
-            std::process::exit(kanban::board::run(&config::load(), ensure, detach));
+        Cmd::Board {
+            ensure,
+            detach,
+            rotate_token,
+            url,
+        } => {
+            std::process::exit(kanban::board::run(
+                &config::load(),
+                ensure,
+                detach,
+                rotate_token,
+                url,
+            ));
         }
         Cmd::Mcp => std::process::exit(kanban::mcp::run(&config::load())),
         Cmd::Merge {

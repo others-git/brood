@@ -214,7 +214,8 @@ impl Delivery for QueueDelivery {
 struct Shared {
     inner: Mutex<Inner>,
     subs: Mutex<Vec<Sender<String>>>,
-    token: String,
+    /// Persisted in the data dir; re-read by the monitor so `--rotate-token` takes effect.
+    token: Mutex<String>,
     columns: Vec<String>,
     delivery: Box<dyn Delivery>,
     conns: AtomicUsize,
@@ -340,6 +341,29 @@ fn host_ok(host: Option<&String>) -> bool {
     })
 }
 
+const COOKIE: &str = "brood_token";
+
+fn cookie_value(header: &str, name: &str) -> Option<String> {
+    header.split(';').find_map(|kv| {
+        let (k, v) = kv.trim().split_once('=')?;
+        (k == name).then(|| v.to_owned())
+    })
+}
+
+/// The persisted board token: reused on every start. `rotate` (or a missing or bad file)
+/// makes a new one.
+pub fn token_from(path: &std::path::Path, rotate: bool) -> std::io::Result<String> {
+    if !rotate && let Ok(t) = std::fs::read_to_string(path) {
+        let t = t.trim();
+        if t.len() == 32 && t.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Ok(t.to_owned());
+        }
+    }
+    let t = rand_hex(32);
+    write_private(path, &t)?;
+    Ok(t)
+}
+
 fn token_ok(given: &str, want: &str) -> bool {
     given.len() == want.len()
         && given
@@ -391,25 +415,42 @@ fn handle_conn(sh: Arc<Shared>, stream: TcpStream) {
         });
         let out = match nonce {
             Some(n) => {
-                json!({"ok": true, "name": "brood-board", "proof": client::proof(&sh.token, n)})
+                json!({"ok": true, "name": "brood-board", "proof": client::proof(&sh.token.lock().unwrap(), n)})
             }
             None => json!({"ok": true, "name": "brood-board"}),
         };
         write_resp(&stream, 200, "application/json", &out.to_string());
         return;
     }
-    // The token travels in a header; the URL form is for the page load and the event stream only.
+    // Header for API clients; cookie for the browser; `?token=` only on the page load and the event stream.
     let query_ok = req.path == "/" || req.path == "/api/events";
-    let given = req
+    let want = sh.token.lock().unwrap().clone();
+    let cookie = req
         .headers
-        .get("x-brood-token")
-        .or_else(|| req.query.get("token").filter(|_| query_ok))
-        .map_or("", String::as_str);
-    if !token_ok(given, &sh.token) {
+        .get("cookie")
+        .and_then(|c| cookie_value(c, COOKIE));
+    let from_query = req.query.get("token").filter(|_| query_ok);
+    let ok = [
+        req.headers.get("x-brood-token"),
+        from_query,
+        cookie.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|g| token_ok(g, &want));
+    if !ok {
         write_resp(&stream, 401, "application/json", r#"{"error":"bad token"}"#);
         return;
     }
     if req.method == "GET" && req.path == "/" {
+        // First visit with the token in the URL: set the cookie and go to the bare URL.
+        if from_query.is_some_and(|g| token_ok(g, &want)) {
+            let head = format!(
+                "HTTP/1.1 302 Found\r\nLocation: /\r\nSet-Cookie: {COOKIE}={want}; HttpOnly; SameSite=Strict; Path=/; Max-Age=315360000\r\nReferrer-Policy: no-referrer\r\nCache-Control: no-store\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = (&stream).write_all(head.as_bytes());
+            return;
+        }
         write_resp(&stream, 200, "text/html; charset=utf-8", UI);
         return;
     }
@@ -887,6 +928,9 @@ fn monitor(sh: Arc<Shared>, idle_limit: Duration) {
     loop {
         std::thread::sleep(Duration::from_millis(1500));
         tick += 1;
+        if let Some(t) = client::read_token() {
+            *sh.token.lock().unwrap() = t;
+        }
         let projects: Vec<Project> = sh
             .inner
             .lock()
@@ -975,7 +1019,23 @@ unsafe extern "C" {
 }
 
 /// Entry for `brood board`. Returns the process exit code.
-pub fn run(cfg: &Config, ensure: bool, detach: bool) -> i32 {
+pub fn run(cfg: &Config, ensure: bool, detach: bool, rotate: bool, url: bool) -> i32 {
+    if rotate || url {
+        let t = match token_from(&client::token_path(), rotate) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("brood board: token: {e}");
+                return 1;
+            }
+        };
+        if rotate {
+            eprintln!("token rotated; open the board with `brood board --url`");
+        }
+        if url {
+            println!("http://127.0.0.1:{}/?token={t}", cfg.kanban_port);
+        }
+        return 0;
+    }
     if ensure {
         client::ensure_board(cfg);
         return 0;
@@ -1008,6 +1068,13 @@ pub fn run(cfg: &Config, ensure: bool, detach: bool) -> i32 {
             return 1;
         }
     };
+    let token = match token_from(&client::token_path(), false) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("brood board: token: {e}");
+            return 1;
+        }
+    };
     let listener = match TcpListener::bind(("127.0.0.1", port)) {
         Ok(l) => l,
         Err(e) => {
@@ -1018,11 +1085,6 @@ pub fn run(cfg: &Config, ensure: bool, detach: bool) -> i32 {
             return 1;
         }
     };
-    let token = rand_hex(32);
-    if let Err(e) = write_private(&client::token_path(), &token) {
-        eprintln!("brood board: token: {e}");
-        return 1;
-    }
     let _ = std::fs::write(pid_path(), format!("{}\n{port}\n", std::process::id()));
 
     let mut inner: Inner = std::fs::read_to_string(state_path())
@@ -1033,7 +1095,7 @@ pub fn run(cfg: &Config, ensure: bool, detach: bool) -> i32 {
     let sh = Arc::new(Shared {
         inner: Mutex::new(inner),
         subs: Mutex::new(vec![]),
-        token,
+        token: Mutex::new(token),
         columns: cfg.kanban_columns.clone(),
         delivery: Box::new(QueueDelivery),
         conns: AtomicUsize::new(0),
@@ -1065,6 +1127,30 @@ mod tests {
         assert!(!host_ok(Some(&"evil.example:47777".to_string())));
         assert!(!host_ok(Some(&"127.0.0.1.evil.com".to_string())));
         assert!(!host_ok(None));
+    }
+
+    #[test]
+    fn token_persists_until_rotated() {
+        let p = std::env::temp_dir().join(format!("brood-tok-{}", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let a = token_from(&p, false).unwrap();
+        assert_eq!(a.len(), 32);
+        assert_eq!(token_from(&p, false).unwrap(), a);
+        let b = token_from(&p, true).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(token_from(&p, false).unwrap(), b);
+        std::fs::write(&p, "junk").unwrap();
+        assert_eq!(token_from(&p, false).unwrap().len(), 32);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn cookie_parsing() {
+        assert_eq!(
+            cookie_value("a=1; brood_token=abc; b=2", COOKIE).as_deref(),
+            Some("abc")
+        );
+        assert_eq!(cookie_value("a=1", COOKIE), None);
     }
 
     #[test]
