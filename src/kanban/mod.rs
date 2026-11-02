@@ -7,6 +7,7 @@ pub mod mcp;
 pub mod paths;
 pub mod store;
 
+#[cfg(unix)]
 use std::io::Read;
 use std::time::{SystemTime, UNIX_EPOCH};
 
