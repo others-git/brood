@@ -81,11 +81,24 @@ fn session_start(cfg: &config::Config, ev: &Value, session: &str) -> Option<Valu
             let pid = procs::current_claude_pid().unwrap_or(0);
             kanban::client::register_session(cfg, session, cwd, root, pid);
         }
-        if cfg.coordinator {
-            parts.push(plugin_file("kanban.md", KANBAN_FALLBACK));
+        // The binary can be newer than the loaded plugin files. Announce the board only
+        // when this plugin ships the MCP server, or the session is told about tools it lacks.
+        let has_tools = std::env::var("CLAUDE_PLUGIN_ROOT")
+            .map(|r| std::path::Path::new(&r).join(".mcp.json").is_file())
+            .unwrap_or(true);
+        if !has_tools {
+            parts.push(
+                "brood: kanban is enabled, but the loaded brood plugin has no kanban tools. \
+                 Tell the user to run `claude plugin update brood@brood` and restart the session."
+                    .to_owned(),
+            );
+        } else {
+            if cfg.coordinator {
+                parts.push(plugin_file("kanban.md", KANBAN_FALLBACK));
+            }
+            // Once per session start, never per prompt.
+            parts.extend(migration_hint(top.as_deref()).map(str::to_owned));
         }
-        // Once per session start, never per prompt.
-        parts.extend(migration_hint(top.as_deref()).map(str::to_owned));
     }
     if parts.is_empty() {
         return None;
