@@ -62,7 +62,17 @@ for _ in $(seq 1 13); do
   sleep 5
 done
 [ -n "$id" ] || { echo "release run for $tag not found" | tee -a "$LOG"; exit 1; }
-run gh run watch "$id" --exit-status -R "$REPO"
+# `gh run watch` dies on transient GitHub API errors (HTTP 5xx); retry until the run ends.
+for try in 1 2 3 4 5; do
+  if gh run watch "$id" --exit-status -R "$REPO" >>"$LOG" 2>&1; then break; fi
+  st=$(gh run view "$id" -R "$REPO" --json status,conclusion --jq '.status+" "+.conclusion' 2>>"$LOG" || true)
+  case "$st" in
+    "completed success") break ;;
+    completed*) echo "release run $id: $st" | tee -a "$LOG"; exit 1 ;;
+  esac
+  [ "$try" = 5 ] && { echo "gh run watch kept failing" | tee -a "$LOG"; exit 1; }
+  sleep 15
+done
 ok "run $id passed: $(gh run view "$id" -R "$REPO" --json jobs --jq '[.jobs[]|"\(.name)=\(.conclusion)"]|join(", ")')"
 
 step=install
