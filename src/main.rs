@@ -49,6 +49,12 @@ enum Cmd {
     },
     /// Stdio MCP server for the kanban tools (started by the plugin).
     Mcp,
+    /// Plugin monitor: print one line per card sent to this session, so an idle session wakes up.
+    #[command(hide = true)]
+    Inbox {
+        #[arg(long)]
+        follow: bool,
+    },
     /// Merge a worktree agent's branch, optionally verify, then remove its worktree and branch.
     Merge {
         /// Branch name or worktree path.
@@ -104,6 +110,11 @@ fn main() {
                 rotate_token,
                 url,
             ));
+        }
+        Cmd::Inbox { follow } => {
+            if follow {
+                std::process::exit(kanban::inbox::follow(&config::load()));
+            }
         }
         Cmd::Mcp => std::process::exit(kanban::mcp::run(&config::load())),
         Cmd::Merge {

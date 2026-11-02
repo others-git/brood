@@ -128,7 +128,7 @@ pub fn handle(
     })
 }
 
-fn session_id(conn: &client::Conn) -> String {
+pub fn session_id(conn: &client::Conn) -> String {
     if let Ok(s) = std::env::var("CLAUDE_CODE_SESSION_ID")
         && !s.is_empty()
     {

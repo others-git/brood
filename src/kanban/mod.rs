@@ -3,6 +3,7 @@
 
 pub mod board;
 pub mod client;
+pub mod inbox;
 pub mod mcp;
 pub mod paths;
 pub mod store;

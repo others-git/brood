@@ -1,0 +1,7 @@
+[
+  {
+    "name": "kanban-inbox",
+    "command": "brood inbox --follow",
+    "description": "Cards sent to this session from the brood kanban board"
+  }
+]
