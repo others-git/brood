@@ -1,48 +1,16 @@
 # brood
 
-brood is a Claude Code plugin with a Rust helper binary. The plugin keeps the main session (the coordinator) free to take new requests. The coordinator sends work to background subagents. The helper binary, `brood hook`, runs on Claude Code hook events. It enforces limits, cleans up processes, and blocks unsafe commands.
+Claude Code plugin plus a Rust hook binary. The main session (coordinator) stays free: work goes to background subagents, and `brood hook` enforces limits, cleans up processes and blocks unsafe commands.
 
-## 1. Requirements
+## Install
 
-- Claude Code with plugin support.
-- The `brood` binary on `PATH`. The hooks run `brood hook`.
-- Rust (edition 2024), only to build with `cargo install`.
+1. Get the binary from [Releases](https://github.com/others-git/brood/releases), or `cargo install --git https://github.com/others-git/brood`. Put it on `PATH`.
+2. In Claude Code: `/plugin marketplace add others-git/brood`, then `/plugin install brood@brood`.
+3. Start a new session.
 
-## 2. Installation
+Try without installing: `claude --plugin-dir ./plugin`.
 
-1. Download the binary from [Releases](https://github.com/others-git/brood/releases). Or run `cargo install --git https://github.com/others-git/brood`.
-2. Put `brood` on your `PATH`.
-3. In Claude Code, run `/plugin marketplace add others-git/brood`.
-4. Run `/plugin install brood@brood`.
-5. Start a new session.
-
-To test without installing, run `claude --plugin-dir ./plugin`.
-
-## 3. Description of function
-
-### 3.1 Coordinator limits
-
-These rules apply to the coordinator only, per user message, when `coordinator` is `true`. Claude Code bookkeeping paths (auto-memory, plans, session scratchpad) are exempt. `#solo` in the message silences all nudges and the refusals below.
-
-**Nudges.** brood adds context to the model and does not block the call. Each nudge fires once per message. `0` disables a threshold.
-
-| Trigger | Threshold | Nudge |
-|---|---|---|
-| Work tool calls (Bash, Read, Grep, Glob, Edit, Write, MultiEdit, NotebookEdit, WebFetch, WebSearch) | `main_tool_budget` = 3 | Soft: "this request is growing". |
-| Distinct files edited | 3 | Soft. |
-| Lines changed in one edit | `trivial_edit_lines` = 30 | Soft. |
-| Work tool calls | `firm_nudge_after` = 8 | Firm: "delegate the remainder now". |
-
-**Refusals.**
-
-| Rule | Override |
-|---|---|
-| Foreground build or replay (`cargo build`, `make`, `npm run build`, game runs). Tests and checks (`cargo test`, `pytest`, `go test`, `npm test`, `cargo check`, `clippy`) run inline | `run_in_background`, or `#solo` |
-| `general-purpose` agent without `model` | Set `model`, or use a brood agent |
-
-Git-only commands and `free_commands` matches do not count toward the nudges. The counts reset when the coordinator turn ends.
-
-### 3.2 Subagent rules
+## Agents
 
 | Agent | Model | Tools |
 |---|---|---|
@@ -50,104 +18,116 @@ Git-only commands and `free_commands` matches do not count toward the nudges. Th
 | `brood:implementer` | Sonnet | All |
 | `brood:reviewer` | Opus | Read, Grep, Glob, Bash |
 
-- Every report starts with `STATUS: complete`, `STATUS: partial` or `STATUS: blocked`.
-- A `brood:` subagent that ends without a `STATUS:` line is sent back.
-- A subagent spawns helpers in the foreground only. The limit is `max_helpers` = 3 per subagent.
-- A subagent that ends while its helpers still run is sent back. After `cleanup_retries` = 2 returns, brood releases it. The coordinator then gets a notice with the first 300 characters of the last message.
+- Reports start with `STATUS: complete`, `partial` or `blocked`. A `brood:` agent without one is sent back.
+- Helpers are foreground only, max `max_helpers` per agent.
+- An agent that ends with helpers or processes still running is sent back `cleanup_retries` times, then released or killed.
 
-### 3.3 Process cleanup
+## Coordinator limits
 
-- brood refuses `nohup`, `setsid`, `disown`, `daemonize`, `start /b`, `start /min`, `Start-Process` and a lone `&`. Use `run_in_background`.
-- A subagent that ends with its own processes or background tasks running is sent back. After `cleanup_retries` returns, brood stops them.
-- Session end stops the leftovers of that session.
-- Session start stops the leftovers of dead sessions.
-- brood finds processes by the `CLAUDE_CODE_SESSION_ID` and `CLAUDE_PID` variables. It does not rewrite your commands.
-- brood sends a polite signal first, then forces a kill. Windows has no polite signal, so brood ends the process at once.
+Per user message, when `coordinator = true`. Bookkeeping paths (memory, plans, scratchpad) are exempt. Git-only and `free_commands` matches are not counted.
 
-### 3.4 Git safety
+| Trigger | Threshold | Result |
+|---|---|---|
+| Work tool calls | `main_tool_budget` (3) | Soft nudge |
+| Distinct files edited | 3 | Soft nudge |
+| Lines in one edit | `trivial_edit_lines` (30) | Soft nudge |
+| Work tool calls | `firm_nudge_after` (8) | Firm nudge: delegate now |
+| Foreground build or replay (`cargo build`, `make`, `npm run build`, game runs) | always | Refused. Use `run_in_background` |
+| `general-purpose` agent without `model` | always | Refused. Set `model` or use a brood agent |
+
+Tests and checks (`cargo test`, `pytest`, `go test`, `npm test`, `cargo check`, `clippy`) run inline. `0` disables a threshold.
+
+**Quick builds.** A foreground compile-only build is allowed when this turn's edits are small (at most `trivial_edit_lines` lines, at most 2 files) and the Bash `timeout` is at most `quick_build_timeout_secs` (120). Commands matching `quick_builds` are always allowed, replays included.
+
+**`#solo`** in a message silences all nudges and refusals for that message.
+
+## Process cleanup
+
+- Refused: `nohup`, `setsid`, `disown`, `daemonize`, `start /b`, `Start-Process`, a lone `&`. Use `run_in_background`.
+- Session end stops that session's leftovers. Session start stops dead sessions' leftovers.
+- Processes are found by `CLAUDE_CODE_SESSION_ID` / `CLAUDE_PID`. Polite signal first, then kill.
+
+## Git safety
 
 | Rule | Action | Override |
 |---|---|---|
-| `git worktree remove` on a worktree with uncommitted or untracked files (build junk like `__pycache__/` ignored) | Refused. brood lists up to 10 files. | `# brood:allow-dirty` in the command |
-| Coordinator merges or removes the branch or worktree of a running or just-resumed agent | Refused | Wait for the agent report |
-| `git merge`, `pull`, `rebase` or `cherry-pick` fails, or a merge script reports a git failure | Warning: do not delete the branch or worktree | None |
+| `git worktree remove` with uncommitted or untracked files (build junk ignored) | Refused, lists up to 10 files | `# brood:allow-dirty` (destroys the files) |
+| Merging or removing the branch or worktree of a running agent | Refused | Wait for its report |
+| `merge`, `pull`, `rebase`, `cherry-pick` fails | Warning: keep branch and worktree | None |
 
-### 3.5 Guards
+**`brood merge <branch-or-path> [--verify "<cmd>"]`** merges a worktree agent's branch.
+
+| Exit | Meaning |
+|---|---|
+| 0 | Merged (and verified). Worktree and branch removed. |
+| 1 | Conflict or verify failure. Both kept. Verify output: `.git/brood-verify.log`. |
+| 2 | Refused: uncommitted files or live agent. |
+
+## Guards
+
+Tripwires, not a security boundary. Claude Code permissions are the real gate.
 
 | Guard | Trigger | Action |
 |---|---|---|
-| Loop | Same Bash command, same agent, `loop_streak` = 4 times in a row | Refused on the 4th run |
-| Script hint | Chain of 3 or more commands, run a second time | Hint to use a script |
+| Loop | Same Bash command `loop_streak` (4) times in a row | Refused |
+| Script hint | Chain of 3+ commands run twice | Hint to script it |
 | Secret | Network command or WebFetch with a secret-looking string | Refused |
-| Credential | Network command that names a credential file | Refused |
-| Credential read | Read or shell use of `.ssh`, `.env`, `.aws/credentials`, `.netrc` and similar | Asks you |
+| Credential | Network command naming a credential file | Refused |
+| Credential read | `.ssh`, `.env`, `.aws/credentials`, `.netrc` | Asks you |
 | Config write | Edit of Claude Code settings, plugins or brood config | Asks you |
-| Injection | Result of a `scan_tools` tool with instruction-like text | Warning: treat as data |
+| Injection | `scan_tools` output with instruction-like text | Warning |
 
-**WARNING:** The guards are tripwires, not a security boundary. The permission system of Claude Code is the real gate.
+## Kanban (optional)
 
-### 3.6 Kanban board (optional)
+Off by default. Enable with `kanban = true` or `BROOD_KANBAN=1`.
 
-Off by default. Set `kanban = true` (or `BROOD_KANBAN=1`) to enable it. brood then keeps cards as markdown files in each project and serves a web board.
+**Cards** are markdown files: `<project>/kanban/<column>/<id>.md`, TOML frontmatter between `+++`. Default columns: `backlog`, `ready`, `in-progress`, `review`, `done`. Commit them; `kanban/.locks/` is gitignored.
 
-- **Cards.** `<project>/kanban/<column>/<id>.md`. Default columns: `backlog`, `ready`, `in-progress`, `review`, `done`. The file has TOML frontmatter between `+++` lines (`id`, `title`, `rev`, `priority`, `tags`, `owner`, `created`, `updated`). The body is the description. IDs look like `20260725-a1b2-fix-login`. Commit the cards. `kanban/.locks/` is gitignored.
-- **Board server.** `brood board` runs one server per machine, on `127.0.0.1:<kanban_port>`. An OS file lock (`board.lock`) in the data directory allows one board; `board.pid` is for `brood gc` only. The SessionStart hook starts a board if none answers. The board is detached from the session and from `brood mcp`. Sessions register on start and unregister on end. The board exits after 10 minutes with no live session. A hook or tool that finds it gone starts a new one. It serves all projects. Projects are identified by a normalised path, so `/mnt/d/x` (WSL) and `D:\x` (Windows) are one project.
-- **Open the board.** Run `brood board --url` and open the URL it prints (`http://127.0.0.1:47777/?token=<token>`). The first visit sets an HttpOnly, SameSite=Strict cookie and redirects to `http://127.0.0.1:47777/`, so you can bookmark the bare URL. The token is made once and kept in `board.token` in the data directory (mode 0600). Every board start reuses it. `brood board --rotate-token` makes a new one: old URLs and cookies stop working. API clients send the `X-Brood-Token` header. The cookie and the header both pass the Host and Origin checks. Requests with a `Host` other than `127.0.0.1` or `localhost`, or with a foreign `Origin`, are refused.
-- **Identity check.** brood sends the token only to a server that proves it knows it: the client sends a random nonce to `/api/health` and checks for HMAC-SHA256(token, nonce). Another program on the port gets no token.
-- **WSL and Windows.** A WSL session and a native Windows session have separate data directories, hence separate tokens and locks. Each side runs its own board. Give them different `kanban_port` values. The cards are the same files, so both boards see the same project. Writes are safe across the two boards: a write checks `rev` and `ver` (a hash of the file) again just before it saves, and a changed file gives 409.
-- **Single writer.** Only the board writes cards, one at a time. Each write carries the card `rev` and `ver`. A stale `rev`, or a file changed by hand or by `git pull` since the card was read, gives 409 and the current card. Moving a card onto an existing id in the target column gives 409. Unknown frontmatter keys are kept. A card with broken frontmatter is shown but refused for writes (400). Outside edits are noticed within about 2 s.
-- **Claims.** `kanban_claim` creates `kanban/.locks/<id>.lock` atomically. A lock of a dead session can be taken over. `brood gc` deletes dead locks when no board runs.
-- **MCP tools.** `brood mcp` (registered in `plugin/.mcp.json`) gives the model `kanban_list`, `kanban_create`, `kanban_update` and `kanban_claim`. With kanban off it lists no tools.
-- **Send.** The board UI can send a card to a live session. The card reaches the model framed as `<kanban-card>` task data that the user queued, not as a system or hook instruction. A card counts as delivered when it is claimed.
-  - Monitor delivery (always on, no launch flag): the plugin ships a background monitor (`plugin/monitors/monitors.json`) that runs `brood inbox --follow` for the life of an interactive session. It waits on the board for cards sent to this session and prints one short line per card (id and title only, never the body). Claude Code turns each line into a notification, which wakes an idle session; the session then reads the card with `kanban_list`, claims it, and works it. Like push, it removes nothing: an unclaimed card is handed over by the hooks after 60 s. The monitor exits when its Claude process ends, and does nothing when kanban is off, in `claude -p` runs, or when `kanban_push` is on (push then owns the inbox). It needs Claude Code with plugin monitors (v2.1.3x or newer).
-  - Hook delivery (always on): the session gets the card in the context of its next prompt, or as a `Stop` block at the end of a running turn. Without the monitor, an idle session gets the card on its next user message.
-  - Push delivery (research preview, off by default): set `kanban_push = true`. `brood mcp` then declares a Claude Code channel and sends the card at once, also to an idle session. Start Claude Code with `claude --dangerously-load-development-channels plugin:brood@brood`. Without the flag, Claude Code drops the push silently, and brood cannot tell. A push removes nothing: if the card is still unclaimed 60 s later, the hooks deliver it too.
-- **First launch.** If a git project has no `kanban/` directory, the session start adds a hint to turn existing planning docs into cards. brood asks you before it creates any card. The first card writes `kanban/.migrated`, and the hint stops.
+**Board.** One server per machine on `127.0.0.1:<kanban_port>`, started by the SessionStart hook, exits 10 minutes after the last session ends.
 
-## 4. Commands
+| Do | How |
+|---|---|
+| Open | `brood board --url`, open the printed `http://127.0.0.1:47777/?token=<token>`. A cookie is set; bookmark the bare URL. |
+| Token | Created once, kept in `board.token` (0600). `brood board --rotate-token` invalidates old URLs. |
+| API | Send header `X-Brood-Token`. Wrong `Host` or `Origin` is refused. |
+| Search | Press `/` on the board. |
+| Send | Card button sends it to a live session. Unsaved edits are saved first. |
+| Claim | The session claims with `kanban_claim` (a lock file). Claimed on create, released on done or backlog. |
+| Decision | Cards in `review` have a Decision box for your verdict. |
+
+**Writes.** Only the board writes cards. A stale `rev`/`ver` or an outside edit gives 409 with the current card. WSL and native Windows run separate boards: give them different `kanban_port` values. They share the card files.
+
+**MCP tools** (`brood mcp`): `kanban_list`, `kanban_create`, `kanban_update`, `kanban_claim`, `kanban_comment`. None when kanban is off.
+
+**Delivery of sent cards** (framed as `<kanban-card>` task data):
+
+| Path | Default | How |
+|---|---|---|
+| Monitor | on | `brood inbox --follow` wakes an idle session with one line per card. Needs plugin monitors (Claude Code 2.1.3x+). |
+| Hooks | on | Card arrives with the next prompt or as a `Stop` block. Also redelivers a card unclaimed after 60 s. |
+| Push | `kanban_push = false` | Channel event. Start with `claude --dangerously-load-development-channels plugin:brood@brood`. |
+
+### Comments
+
+- Users and sessions add comments to a card, shown as a flat list.
+- Sessions use `kanban_comment`. Its `awaiting_user` flag shows an "awaiting you" badge.
+- User comments go to the owning session.
+- If the owner is offline, they wait and go with the next send.
+
+## Commands
 
 | Command | Function |
 |---|---|
-| `brood hook` | Handle a hook event from stdin. Claude Code runs it. Do not run it by hand. |
-| `brood gc` | Stop processes of dead Claude Code sessions. Delete session state older than 7 days and the kanban claim locks of dead sessions. |
-| `brood gc --dry-run` | List the processes `gc` would stop. Stop nothing. |
-| `brood merge <branch-or-path> [--verify "<cmd>"]` | Merge a worktree agent's branch. Refuse (exit 2) if the worktree has uncommitted non-junk files or its agent is live. Run `--verify` after the merge; write its output to `.git/brood-verify.log`. On conflict or verify failure, keep the worktree and branch (exit 1). On success, remove both. Free of the coordinator budget. |
-| `brood board` | Run the kanban board server. Exit 0 if one is already running. |
-| `brood board --url` | Print the board URL with its token. |
-| `brood board --rotate-token` | Make a new access token. |
-| `brood board --ensure` | Start a detached board if none answers. The hooks use this. |
-| `brood mcp` | Stdio MCP server for the kanban tools. Claude Code runs it. |
-| `brood ps` | List live processes tagged with a session: session, PID, command. |
+| `brood hook` | Hook handler. Claude Code runs it. |
+| `brood gc [--dry-run]` | Stop processes of dead sessions, prune state older than 7 days, remove dead claim locks. |
+| `brood ps` | List live session-tagged processes. |
+| `brood merge <target> [--verify "<cmd>"]` | See Git safety. |
+| `brood board [--url \| --rotate-token \| --ensure]` | Run the board, print its URL, rotate the token, or start it detached. |
+| `brood mcp` | Kanban MCP server. Claude Code runs it. |
 
-## 5. Configuration
+## Configuration
 
-The file is optional. Every key is optional.
-
-| Key | Default | Function |
-|---|---|---|
-| `coordinator` | `true` | Inject the coordinator prompt and enforce coordinator limits. |
-| `loop_streak` | `4` | Identical commands in a row before refusal. `0` = off. |
-| `cleanup_retries` | `2` | Times brood sends a subagent back before it cleans up. |
-| `max_helpers` | `3` | Helpers per subagent. `0` = no cap. |
-| `main_tool_budget` | `3` | Work tool calls per message that trigger the soft nudge. `0` = off. |
-| `trivial_edit_lines` | `30` | Edit size (lines) that triggers the soft nudge. `0` = off. |
-| `firm_nudge_after` | `8` | Work tool calls per message that trigger the firm nudge. `0` = off. |
-| `free_commands` | `[]` | Regexes for shell commands that do not count toward the nudges. |
-| `scan_tools` | `^(WebFetch\|WebSearch\|mcp__.*)$` | Regex on tool names whose output brood scans. |
-| `extra_secret_patterns` | `[]` | Extra regexes for secrets. |
-| `extra_injection_patterns` | `[]` | Extra regexes for instruction-like text. |
-| `kanban` | `false` | Enable the kanban board (3.6). |
-| `kanban_port` | `47777` | Board port, on 127.0.0.1. |
-| `kanban_columns` | `["backlog","ready","in-progress","review","done"]` | Board columns, left to right. Letters, digits, `-` and `_`. |
-| `kanban_push` | `false` | Also push sent cards as channel events (needs the launch flag in 3.6). |
-| `worktree_junk` | `[]` | Extra `name/` or `*.ext` patterns the worktree-remove guard ignores, on top of `__pycache__/`, `*.pyc`, `node_modules/`, `target/` and similar. Untracked files only. |
-
-```toml
-coordinator = true
-main_tool_budget = 5
-free_commands = ["^ls\\b"]
-extra_secret_patterns = ["mykey_[A-Za-z0-9]{32}"]
-```
+Optional file; all keys optional. A file that does not parse means all defaults.
 
 | OS | Path |
 |---|---|
@@ -155,64 +135,55 @@ extra_secret_patterns = ["mykey_[A-Za-z0-9]{32}"]
 | macOS | `~/Library/Application Support/brood/config.toml` |
 | Windows | `%APPDATA%\brood\config.toml` |
 
-Environment variables:
+| Key | Default | Function |
+|---|---|---|
+| `coordinator` | `true` | Coordinator prompt and limits |
+| `loop_streak` | `4` | Identical commands before refusal (0 = off) |
+| `cleanup_retries` | `2` | Send-backs before brood cleans up |
+| `max_helpers` | `3` | Helpers per subagent (0 = no cap) |
+| `main_tool_budget` | `3` | Calls before soft nudge (0 = off) |
+| `trivial_edit_lines` | `30` | Edit lines before soft nudge (0 = off); also the quick-build edit limit |
+| `firm_nudge_after` | `8` | Calls before firm nudge (0 = off) |
+| `quick_build_timeout_secs` | `120` | Max Bash timeout for a quick build |
+| `quick_builds` | `[]` | Regexes for builds always allowed |
+| `free_commands` | `[]` | Regexes for commands not counted |
+| `scan_tools` | `^(WebFetch\|WebSearch\|mcp__.*)$` | Tool names whose output is scanned |
+| `extra_secret_patterns` | `[]` | Extra secret regexes |
+| `extra_injection_patterns` | `[]` | Extra injection regexes |
+| `worktree_junk` | `[]` | Extra `name/` or `*.ext` ignored by the worktree guard |
+| `kanban` | `false` | Enable the board |
+| `kanban_port` | `47777` | Board port |
+| `kanban_columns` | `["backlog","ready","in-progress","review","done"]` | Columns (letters, digits, `-`, `_`) |
+| `kanban_push` | `false` | Also push sent cards as channel events |
 
-| Variable | Function |
-|---|---|
-| `BROOD_COORDINATOR=0` (or `false`) | Disable coordinator mode. |
-| `BROOD_KANBAN=1` (or `0`) | Enable (disable) the kanban board. Overrides the file. |
-| `BROOD_KANBAN_PORT` | Board port. Overrides the file. |
-| `BROOD_DATA_DIR` | Data directory. |
-| `BROOD_DEBUG=1` | Also log raw hook events to the global log. |
+Env: `BROOD_COORDINATOR=0`, `BROOD_KANBAN=1\|0`, `BROOD_KANBAN_PORT`, `BROOD_DATA_DIR`, `BROOD_DEBUG=1` (raw hook events in the log).
 
-To change the coordinator instructions, edit `plugin/context/coordinator.md`. brood reads it from `CLAUDE_PLUGIN_ROOT` at session start. No rebuild is needed.
+Coordinator prompt: edit `plugin/context/coordinator.md`; no rebuild needed.
 
-## 6. Logs and troubleshooting
+## Logs and troubleshooting
 
-The data directory is `~/.local/share/brood` (Linux), `~/Library/Application Support/brood` (macOS) or `%LOCALAPPDATA%\brood` (Windows).
+Data dir: `~/.local/share/brood` (Linux), `~/Library/Application Support/brood` (macOS), `%LOCALAPPDATA%\brood` (Windows).
 
 | File | Content |
 |---|---|
-| `sessions/<session_id>/brood.log` | Denials, releases and kills of one session |
-| `board.lock`, `board.pid`, `board.token`, `board-state.json` | Kanban board lock, pid and port, access token, registered sessions and sent cards |
-| `brood.log` | Hook errors, and raw events when `BROOD_DEBUG=1` |
+| `sessions/<id>/brood.log` | Denials, releases, kills per session |
+| `brood.log` | Hook errors |
+| `board.*` | Board lock, pid, token, state |
 
-| Problem | Action |
+| Problem | Fix |
 |---|---|
-| Hooks do nothing | Make sure `brood --version` works in the shell Claude Code uses. |
-| Coordinator refuses a small task | Only a foreground build or replay is refused: run it in the background. Add `#solo` to the message to allow it. Nudges are advice: raise `main_tool_budget` or `firm_nudge_after`, or set them to `0`. |
-| Config has no effect | Check the TOML syntax. brood uses all defaults if the file does not parse. |
-| Processes remain | Run `brood ps`, then `brood gc`. |
+| Hooks do nothing | `brood --version` must work in Claude Code's shell |
+| Small task refused | Run the build in background, or add `#solo` |
+| Config ignored | Check TOML syntax |
+| Stray processes | `brood ps`, then `brood gc` |
 
-## 7. Limits
+## Limits
 
-**WARNING:** The guards are tripwires. Do not rely on them to stop a malicious command.
+- brood fails open: a failed hook lets the call through.
+- The worktree guard skips quoted paths with spaces and paths set by `git -C` or `cd`.
+- Windows `.exe` processes started from WSL are not cleaned.
+- Only Windows and macOS builds are tested in CI.
 
-**WARNING:** `# brood:allow-dirty` destroys uncommitted files in the worktree. Use it only when you want that.
+## Release (maintainers)
 
-**CAUTION:** The worktree guard skips quoted paths with spaces. It also skips paths set by `git -C` or `cd`. It does not refuse these commands.
-
-**CAUTION:** Agent-team teammates do not appear in `claude -p` runs. This mode is untested.
-
-**CAUTION:** CI tests Windows and macOS builds only. Native use on those systems is not otherwise tested.
-
-**NOTE:** brood fails open. If the hook fails, the tool call goes on.
-
-**NOTE:** Windows `.exe` processes started from WSL are not in the Linux process table. brood does not clean them.
-
-**NOTE:** If Claude Code crashes, brood sweeps the leftovers at the next session start.
-
-## 8. Release procedure (maintainers)
-
-Requirements: `cargo`, `git`, `gh` and `claude` on `PATH`. The script runs `git add -A`, so commit or stash unrelated changes first.
-
-1. Run `tools/release.sh X.Y.Z [commit-message-file]`.
-2. The script stops if tag `vX.Y.Z` exists.
-3. It sets the version in `Cargo.toml` and `plugin/.claude-plugin/plugin.json`.
-4. It runs `cargo build` and `cargo test`.
-5. It commits, tags `vX.Y.Z`, and pushes `main` and the tag.
-6. The tag starts the `release` workflow. The script waits for it to pass.
-7. It installs the Linux x86_64 binary to `~/.local/bin/brood` and checks the version.
-8. It updates the Claude Code marketplace and the plugin.
-
-On failure, the script prints the failed step. The log is `${TMPDIR:-/tmp}/brood-release.log`.
+`tools/release.sh X.Y.Z [commit-message-file]` bumps versions, builds, tests, commits, tags, pushes, waits for the release workflow, then installs the binary and updates the plugin. Needs `cargo`, `git`, `gh`, `claude`. It runs `git add -A`. Log: `${TMPDIR:-/tmp}/brood-release.log`.
