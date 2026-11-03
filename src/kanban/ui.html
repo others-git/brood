@@ -214,7 +214,19 @@ $("save").onclick = async () => {
 $("send").onclick = async () => {
   const session = $("f-sess").value;
   if (!session || !editing) { note("no session to send to"); return; }
-  await sendCard(editing.id, session);
+  const body = {title: $("f-title").value, body: $("f-body").value, priority: $("f-prio").value,
+    tags: $("f-tags").value.split(",").map(t => t.trim()).filter(Boolean)};
+  if (editing.column === "review") body.decision = $("f-dec").value;
+  const same = body.title === editing.title && body.body === editing.body && body.priority === editing.priority &&
+    body.tags.join("\n") === editing.tags.join("\n") && (body.decision === undefined || body.decision === (editing.decision || ""));
+  if (!same) {
+    if (!body.title.trim()) { note("title required"); return; }
+    const r = await api("PATCH", `/api/projects/${project}/cards/${editing.id}`, {...body, rev: editing.rev, ver: editing.ver});
+    if (r.status === 409) { note("changed elsewhere, reloaded"); $("dlg").close(); await loadCards(); return; }
+    if (r.status >= 400) { note(r.data && r.data.error || "save failed"); return; }
+    editing = r.data;
+  }
+  if (await sendCard(editing.id, session)) { $("dlg").close(); await loadCards(); }
 };
 $("proj").onchange = () => { project = $("proj").value; localStorage.setItem("brood-project", project); loadCards(); };
 
