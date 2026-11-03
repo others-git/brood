@@ -37,6 +37,12 @@ pub fn notice_line(card: &Value) -> String {
         .chars()
         .take(TITLE_MAX)
         .collect();
+    if card["comment_only"].as_bool() == Some(true) {
+        return format!(
+            "brood kanban: the user commented on card {id} \"{title}\". \
+             Call kanban_list id={id} to read the comment."
+        );
+    }
     format!(
         "brood kanban: card {id} \"{title}\" was sent to this session by the user. \
          Call kanban_list id={id}, claim it with kanban_claim, then work it."
@@ -108,6 +114,15 @@ mod tests {
         assert!(l.contains("card ab-12 \"Fix it now\""));
         assert!(l.contains("kanban_list id=ab-12"));
         assert!(!l.contains("SECRET"));
+    }
+
+    #[test]
+    fn comment_line_names_card_only() {
+        let l = notice_line(
+            &json!({"card": "ab-12", "title": "T", "comment_only": true, "comments": [{"at": "x", "text": "SECRET"}]}),
+        );
+        assert_eq!(l.lines().count(), 1);
+        assert!(l.contains("commented on card ab-12") && !l.contains("SECRET"));
     }
 
     #[test]

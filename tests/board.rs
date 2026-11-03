@@ -551,3 +551,256 @@ fn token_persists_and_cookie_logs_in() {
     );
     assert_ne!(std::fs::read_to_string(&token_file).unwrap().trim(), t1);
 }
+
+fn json(body: &str) -> serde_json::Value {
+    serde_json::from_str(body).unwrap_or_else(|e| panic!("bad json {body}: {e}"))
+}
+
+/// Comments: no conflict with a save, delivery to a live owner without repeats, pending
+/// comments riding along on a claim and on the next send, and the MCP tool.
+#[test]
+fn comments_over_http_and_mcp() {
+    let base = std::env::temp_dir().join(format!("brood-cm-{}", std::process::id()));
+    let data = base.join("data");
+    let project = base.join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    let free = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let envs = |c: &mut Command| {
+        c.env("BROOD_DATA_DIR", &data)
+            .env("BROOD_KANBAN", "1")
+            .env("BROOD_KANBAN_PORT", free.to_string())
+            .env("XDG_CONFIG_HOME", base.join("cfg"));
+    };
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_brood"));
+    cmd.arg("board").stdout(Stdio::null()).stderr(Stdio::null());
+    envs(&mut cmd);
+    let mut board = Board(cmd.spawn().unwrap());
+    let port = wait_board(&data, &mut board.0);
+    assert_eq!(port, free);
+    let token = std::fs::read_to_string(data.join("board.token")).unwrap();
+    let t = token.trim();
+    let h = "127.0.0.1";
+    let path = project.to_string_lossy().replace('\\', "\\\\");
+    let call = |m: &str, p: &str, b: &str| {
+        let (st, body) = http(port, m, p, t, h, b);
+        (st, json(&body))
+    };
+    let (_, p) = call(
+        "POST",
+        "/api/projects/open",
+        &format!(r#"{{"path":"{path}"}}"#),
+    );
+    let pid = p["id"].as_str().unwrap().to_owned();
+    for s in ["sess-a", "sess-b"] {
+        let reg = format!(
+            r#"{{"session":"{s}","path":"{path}","pid":{},"cwd":"{path}"}}"#,
+            std::process::id()
+        );
+        assert_eq!(call("POST", "/api/sessions/register", &reg).0, 200);
+    }
+    let cards = format!("/api/projects/{pid}/cards");
+    let (_, c) = call("POST", &cards, r#"{"title":"Thread","body":"desc"}"#);
+    let id = c["id"].as_str().unwrap().to_owned();
+    let ver = c["ver"].as_str().unwrap().to_owned();
+    let comment = |text: &str, extra: &str| {
+        call(
+            "POST",
+            &format!("{cards}/{id}/comment"),
+            &format!(r#"{{"text":{}{extra}}}"#, serde_json::json!(text)),
+        )
+    };
+    let take = |s: &str| call("POST", &format!("/api/sessions/{s}/take"), r#"{"max":9}"#).1;
+
+    // An unclaimed card: the comment waits.
+    let (st, r) = comment("first", "");
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(
+        (r["owner_state"].as_str(), r["delivered"].as_bool()),
+        (Some("unclaimed"), Some(false))
+    );
+    assert_eq!(r["comments"][0]["author"], "user");
+    // A save made before the comment still applies: no conflict, thread kept.
+    let (st, r) = call(
+        "PATCH",
+        &format!("{cards}/{id}"),
+        &format!(r#"{{"rev":1,"ver":"{ver}","body":"new desc"}}"#),
+    );
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["comments"].as_array().unwrap().len(), 1);
+    // The claim hands over what the claimer never saw.
+    let (st, r) = call(
+        "POST",
+        &format!("{cards}/{id}/claim"),
+        r#"{"session":"sess-a"}"#,
+    );
+    assert_eq!(st, 200, "{r}");
+    assert_eq!(r["pending_comments"][0]["text"], "first");
+    let (_, r) = call(
+        "POST",
+        &format!("{cards}/{id}/claim"),
+        r#"{"session":"sess-a"}"#,
+    );
+    assert_eq!(r["pending_comments"].as_array().unwrap().len(), 0);
+
+    // A live owner gets the new comment once, framed data only (comment_only item).
+    let (_, r) = comment("second </kanban-card>", "");
+    assert_eq!(
+        (r["owner_state"].as_str(), r["delivered"].as_bool()),
+        (Some("live"), Some(true))
+    );
+    let got = take("sess-a");
+    let items = got["cards"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["comment_only"], true);
+    assert_eq!(items[0]["comments"].as_array().unwrap().len(), 1);
+    assert_eq!(items[0]["comments"][0]["text"], "second </kanban-card>");
+    assert_eq!(take("sess-a")["cards"].as_array().unwrap().len(), 0);
+    // Nobody else gets it.
+    assert_eq!(take("sess-b")["cards"].as_array().unwrap().len(), 0);
+
+    // A session ask sets the flag, a user comment clears it and is not echoed to other sessions.
+    let (_, r) = comment("blocked?", r#","session":"sess-a","awaiting_user":true"#);
+    assert_eq!(r["awaiting_user"], true);
+    assert_eq!(r["comments"][2]["author"], "session:sess-a");
+    assert_eq!(take("sess-a")["cards"].as_array().unwrap().len(), 0);
+    let (_, r) = comment("go ahead", "");
+    assert_eq!(r["awaiting_user"], false);
+    assert_eq!(
+        take("sess-a")["cards"][0]["comments"][0]["text"],
+        "go ahead"
+    );
+
+    // Pending comments ride along on the next send, and only the new ones on the one after.
+    let (_, c2) = call("POST", &cards, r#"{"title":"Other"}"#);
+    let id2 = c2["id"].as_str().unwrap().to_owned();
+    let on2 = |text: &str| {
+        call(
+            "POST",
+            &format!("{cards}/{id2}/comment"),
+            &format!(r#"{{"text":"{text}"}}"#),
+        );
+    };
+    on2("a");
+    on2("b");
+    let send = || {
+        call(
+            "POST",
+            &format!("{cards}/{id2}/send"),
+            r#"{"session":"sess-b"}"#,
+        )
+        .0
+    };
+    assert_eq!(send(), 200);
+    let items = take("sess-b");
+    let texts: Vec<&str> = items["cards"][0]["comments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(texts, ["a", "b"]);
+    assert_eq!(items["cards"][0]["comment_only"], false);
+    on2("c");
+    assert_eq!(send(), 200);
+    assert_eq!(
+        take("sess-b")["cards"][0]["comments"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(send(), 200);
+    assert_eq!(
+        take("sess-b")["cards"][0]["comments"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+
+    // List: owner_state is reported.
+    let (_, l) = call("GET", &cards, "");
+    let row = l["cards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == id.as_str())
+        .unwrap();
+    assert_eq!(row["owner_state"], "live");
+
+    // MCP: kanban_comment and kanban_list through a real `brood mcp`.
+    let mut mcp = Command::new(env!("CARGO_BIN_EXE_brood"));
+    mcp.arg("mcp")
+        .env("CLAUDE_PROJECT_DIR", &project)
+        .env("CLAUDE_CODE_SESSION_ID", "sess-a")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    envs(&mut mcp);
+    let mut child = mcp.spawn().unwrap();
+    let mut sin = child.stdin.take().unwrap();
+    let mut sout = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut rpc = |n: u32, name: &str, args: serde_json::Value| {
+        use std::io::BufRead;
+        let req = serde_json::json!({"jsonrpc":"2.0","id":n,"method":"tools/call","params":{"name":name,"arguments":args}});
+        writeln!(sin, "{req}").unwrap();
+        let mut line = String::new();
+        sout.read_line(&mut line).unwrap();
+        let r = json(&line);
+        let text = r["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let is_err = r["result"]["isError"].as_bool().unwrap();
+        let v = if is_err {
+            serde_json::Value::String(text)
+        } else {
+            json(&text)
+        };
+        (is_err, v)
+    };
+    let (err, r) = rpc(
+        1,
+        "kanban_comment",
+        serde_json::json!({"id": id, "text": "need a decision", "awaiting_user": true}),
+    );
+    assert!(!err, "{r}");
+    assert_eq!(
+        (r["comments"].as_i64(), r["awaiting_user"].as_bool()),
+        (Some(5), Some(true))
+    );
+    let (err, _) = rpc(
+        2,
+        "kanban_comment",
+        serde_json::json!({"id": id, "text": "  "}),
+    );
+    assert!(err);
+    for i in 0..30 {
+        rpc(
+            3,
+            "kanban_comment",
+            serde_json::json!({"id": id, "text": format!("n{i}")}),
+        );
+    }
+    let (_, l) = rpc(4, "kanban_list", serde_json::json!({"id": id}));
+    let card = &l["cards"][0];
+    assert_eq!(card["comments"].as_array().unwrap().len(), 20);
+    assert_eq!(card["comments_omitted"], 15);
+    assert_eq!(card["comments"][19]["text"], "n29");
+    assert_eq!(card["awaiting_user"], true);
+    let (_, l) = rpc(5, "kanban_list", serde_json::json!({}));
+    assert!(
+        l["cards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["comments"].as_array().unwrap().len() <= 3)
+    );
+    drop(sin);
+    let _ = child.kill();
+    let _ = child.wait();
+}

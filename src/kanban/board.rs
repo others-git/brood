@@ -112,6 +112,19 @@ pub struct Sent {
     /// When the push transport got it (0 = not pushed). It stays queued until the card is claimed.
     #[serde(default)]
     pub pushed: u64,
+    /// User comments the receiving session has not been given yet.
+    #[serde(default)]
+    pub comments: Vec<SentComment>,
+    /// A delivery of new comments only (no card body). Not tied to a claim: it is handed over
+    /// once, by whichever path asks first.
+    #[serde(default)]
+    pub comment_only: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct SentComment {
+    pub at: String,
+    pub text: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -121,6 +134,8 @@ pub struct Inner {
     pub sessions: BTreeMap<String, Session>,
     pub queue: BTreeMap<String, Vec<Sent>>,
     pub next_seq: u64,
+    /// Per session and `project/card`: how many of the card's comments it has been given.
+    pub seen: BTreeMap<String, BTreeMap<String, usize>>,
     #[serde(skip, default = "Instant::now")]
     pub idle_since: Instant,
 }
@@ -132,6 +147,7 @@ impl Default for Inner {
             sessions: BTreeMap::new(),
             queue: BTreeMap::new(),
             next_seq: 0,
+            seen: BTreeMap::new(),
             idle_since: Instant::now(),
         }
     }
@@ -141,7 +157,7 @@ impl Default for Inner {
 /// The push path (`pull_for_push`) only marks it; the hooks (`take_for_hook`) deliver cards
 /// never pushed, or pushed more than `PUSH_GRACE_SECS` ago and still unclaimed.
 fn hook_takeable(it: &Sent, now: u64) -> bool {
-    it.pushed == 0 || now.saturating_sub(it.pushed) > PUSH_GRACE_SECS
+    it.comment_only || it.pushed == 0 || now.saturating_sub(it.pushed) > PUSH_GRACE_SECS
 }
 
 pub fn take_for_hook(
@@ -178,19 +194,55 @@ pub fn pull_for_push(
         return vec![];
     };
     q.retain(|it| !settled(it));
-    q.iter_mut()
-        .filter(|it| it.pushed == 0)
+    let mut out: Vec<Sent> = q
+        .iter_mut()
+        .filter(|it| it.pushed == 0 && !it.comment_only)
         .map(|it| {
             it.pushed = now;
             it.clone()
         })
-        .collect()
+        .collect();
+    // New comments are handed over once: pushing them removes them, so no path repeats them.
+    q.retain(|it| {
+        if it.comment_only {
+            out.push(it.clone());
+        }
+        !it.comment_only
+    });
+    out
+}
+
+/// The user comments on `card` that `sid` has not been given; marks them all as given.
+pub fn take_unseen(
+    inner: &mut Inner,
+    sid: &str,
+    project: &str,
+    card: &store::Card,
+) -> Vec<SentComment> {
+    let seen = inner
+        .seen
+        .entry(sid.to_owned())
+        .or_default()
+        .entry(format!("{project}/{}", card.meta.id))
+        .or_default();
+    let out = card
+        .comments
+        .iter()
+        .skip(*seen)
+        .filter(|c| c.is_user())
+        .map(|c| SentComment {
+            at: c.at.clone(),
+            text: c.text.clone(),
+        })
+        .collect();
+    *seen = card.comments.len();
+    out
 }
 
 /// A card was claimed: it needs no delivery to anyone.
 pub fn forget_card(inner: &mut Inner, project: &str, card: &str) {
     for q in inner.queue.values_mut() {
-        q.retain(|i| !(i.card == card && i.project == project));
+        q.retain(|i| i.comment_only || !(i.card == card && i.project == project));
     }
 }
 
@@ -199,7 +251,24 @@ fn card_settled(roots: &HashMap<String, PathBuf>, cols: &[String], it: &Sent) ->
     roots
         .get(&it.project)
         .and_then(|r| store::find(r, cols, &it.card))
-        .is_none_or(|(_, c)| !c.meta.owner.is_empty())
+        .is_none_or(|(_, c)| !it.comment_only && !c.meta.owner.is_empty())
+}
+
+/// `unclaimed`, `live` or `offline` (claimed by a session the board no longer knows).
+fn owner_state(inner: &Inner, card: &store::Card) -> &'static str {
+    if card.meta.owner.is_empty() {
+        "unclaimed"
+    } else if inner.sessions.contains_key(&card.meta.owner) {
+        "live"
+    } else {
+        "offline"
+    }
+}
+
+fn card_json(inner: &Inner, card: &store::Card) -> Value {
+    let mut v = json!(card);
+    v["owner_state"] = json!(owner_state(inner, card));
+    v
 }
 
 fn roots_of(inner: &Inner) -> HashMap<String, PathBuf> {
@@ -635,6 +704,7 @@ fn route(sh: &Arc<Shared>, req: &Req, body: &Value) -> (u16, Value) {
                 release_all(&g, cols, &sess);
             }
             g.queue.remove(&sid);
+            g.seen.remove(&sid);
             save_state(&g);
             drop(g);
             broadcast(sh, json!({"type": "sessions"}));
@@ -698,11 +768,12 @@ fn route(sh: &Arc<Shared>, req: &Req, body: &Value) -> (u16, Value) {
             let Some(root) = project_root(sh, p) else {
                 return err(404, "no such project");
             };
-            let _g = sh.inner.lock().unwrap();
-            (
-                200,
-                json!({"columns": cols, "cards": store::list(&root, cols)}),
-            )
+            let g = sh.inner.lock().unwrap();
+            let list: Vec<Value> = store::list(&root, cols)
+                .iter()
+                .map(|c| card_json(&g, c))
+                .collect();
+            (200, json!({"columns": cols, "cards": list}))
         }
         ("POST", ["api", "projects", p, "cards"]) => {
             let Some(root) = project_root(sh, p) else {
@@ -812,6 +883,7 @@ fn route(sh: &Arc<Shared>, req: &Req, body: &Value) -> (u16, Value) {
             if let Err(owner) = store::try_lock(&root, id, &sid, &alive) {
                 return store_err(Err::Claimed(owner));
             }
+            let sid_c = sid.clone();
             let r = store::update(
                 &root,
                 cols,
@@ -824,9 +896,16 @@ fn route(sh: &Arc<Shared>, req: &Req, body: &Value) -> (u16, Value) {
                 },
             );
             forget_card(&mut g, p, id);
+            // User comments this session was never given ride along on the claim.
+            let r = r.map(|c| {
+                let pending = take_unseen(&mut g, &sid_c, p, &c);
+                let mut v = json!(c);
+                v["pending_comments"] = json!(pending);
+                (200, v)
+            });
             save_state(&g);
             drop(g);
-            changed(sh, p, r.map(|c| (200, json!(c))))
+            changed(sh, p, r)
         }
         ("POST", ["api", "projects", p, "cards", id, "release"]) => {
             let Some(root) = project_root(sh, p) else {
@@ -860,6 +939,59 @@ fn route(sh: &Arc<Shared>, req: &Req, body: &Value) -> (u16, Value) {
             drop(g);
             changed(sh, p, r.map(|c| (200, json!(c))))
         }
+        // A comment: from the user (UI) or from a session (`session` set). A user comment goes
+        // to the card's owner when that session is live; otherwise it waits (see `take_unseen`).
+        ("POST", ["api", "projects", p, "cards", id, "comment"]) => {
+            let Some(root) = project_root(sh, p) else {
+                return err(404, "no such project");
+            };
+            let Some(text) = s(body, "text") else {
+                return err(400, "text required");
+            };
+            let sid = s(body, "session");
+            let author = match &sid {
+                None => store::USER.to_owned(),
+                Some(x) if valid_sid(x) => {
+                    format!("session:{}", x.chars().take(8).collect::<String>())
+                }
+                Some(_) => return err(400, "bad session id"),
+            };
+            let mut g = sh.inner.lock().unwrap();
+            let awaiting = body["awaiting_user"].as_bool() == Some(true);
+            let r = store::add_comment(&root, cols, id, &author, &text, awaiting);
+            let mut delivered = false;
+            if let (Ok(card), None) = (&r, &sid)
+                && owner_state(&g, card) == "live"
+            {
+                let owner = card.meta.owner.clone();
+                let comments = take_unseen(&mut g, &owner, p, card);
+                if !comments.is_empty() {
+                    g.next_seq += 1;
+                    let item = Sent {
+                        seq: g.next_seq,
+                        card: card.meta.id.clone(),
+                        project: (*p).to_owned(),
+                        title: card.meta.title.clone(),
+                        body: String::new(),
+                        decision: String::new(),
+                        at: now_secs(),
+                        pushed: 0,
+                        comments,
+                        comment_only: true,
+                    };
+                    sh.delivery.deliver(&mut g, &owner, item);
+                    delivered = true;
+                }
+            }
+            save_state(&g);
+            let r = r.map(|c| {
+                let mut v = card_json(&g, &c);
+                v["delivered"] = json!(delivered);
+                (200, v)
+            });
+            drop(g);
+            changed(sh, p, r)
+        }
         ("POST", ["api", "projects", p, "cards", id, "send"]) => {
             let Some(root) = project_root(sh, p) else {
                 return err(404, "no such project");
@@ -875,6 +1007,7 @@ fn route(sh: &Arc<Shared>, req: &Req, body: &Value) -> (u16, Value) {
                 return err(404, "no such card");
             };
             g.next_seq += 1;
+            let comments = take_unseen(&mut g, &sid, p, &card);
             let item = Sent {
                 seq: g.next_seq,
                 card: card.meta.id,
@@ -884,6 +1017,8 @@ fn route(sh: &Arc<Shared>, req: &Req, body: &Value) -> (u16, Value) {
                 decision: card.decision,
                 at: now_secs(),
                 pushed: 0,
+                comments,
+                comment_only: false,
             };
             sh.delivery.deliver(&mut g, &sid, item);
             save_state(&g);
@@ -1028,6 +1163,7 @@ fn monitor(sh: Arc<Shared>, idle_limit: Duration) {
                         release_all(&g, &sh.columns, &sess);
                     }
                     g.queue.remove(sid);
+                    g.seen.remove(sid);
                 }
                 save_state(&g);
             }
@@ -1226,6 +1362,8 @@ mod tests {
             decision: String::new(),
             at: 0,
             pushed: 0,
+            comments: vec![],
+            comment_only: false,
         }
     }
 
@@ -1265,6 +1403,57 @@ mod tests {
         // c2 got claimed (owner set): settled, dropped by the hook.
         let settled = |it: &Sent| it.card == "c2";
         assert!(take_for_hook(&mut inner, "s1", 5000, 9, &settled).is_empty());
+        assert!(inner.queue["s1"].is_empty());
+    }
+
+    fn card_with(comments: &[(&str, &str)]) -> store::Card {
+        let mut c = store::parse("", "backlog", "c");
+        c.comments = comments
+            .iter()
+            .map(|(a, t)| store::Comment {
+                author: (*a).into(),
+                at: "2026-01-01T00:00:00Z".into(),
+                text: (*t).into(),
+                awaiting: false,
+            })
+            .collect();
+        c
+    }
+
+    #[test]
+    fn each_session_gets_a_comment_once() {
+        let mut inner = Inner::default();
+        let mut c = card_with(&[("user", "one"), ("session:ab", "mine"), ("user", "two")]);
+        let got = take_unseen(&mut inner, "s1", "p", &c);
+        assert_eq!(
+            got.iter().map(|x| x.text.as_str()).collect::<Vec<_>>(),
+            ["one", "two"]
+        );
+        assert!(take_unseen(&mut inner, "s1", "p", &c).is_empty());
+        // Another session still has all of them; a new comment reaches both.
+        assert_eq!(take_unseen(&mut inner, "s2", "p", &c).len(), 2);
+        c.comments
+            .push(card_with(&[("user", "three")]).comments.remove(0));
+        assert_eq!(take_unseen(&mut inner, "s1", "p", &c)[0].text, "three");
+    }
+
+    #[test]
+    fn comment_items_ignore_claims_and_deliver_once() {
+        let mut inner = Inner::default();
+        let mut it = sent(1, "c1");
+        it.comment_only = true;
+        QueueDelivery.deliver(&mut inner, "s1", it);
+        // The claim of the card does not drop them.
+        forget_card(&mut inner, "p", "c1");
+        assert_eq!(inner.queue["s1"].len(), 1);
+        // The hook path takes it at once, and only once.
+        assert_eq!(take_for_hook(&mut inner, "s1", 5, 9, &|_| false).len(), 1);
+        assert!(take_for_hook(&mut inner, "s1", 5, 9, &|_| false).is_empty());
+        // The push path takes it and removes it.
+        let mut it = sent(2, "c1");
+        it.comment_only = true;
+        QueueDelivery.deliver(&mut inner, "s1", it);
+        assert_eq!(pull_for_push(&mut inner, "s1", 9, &|_| false).len(), 1);
         assert!(inner.queue["s1"].is_empty());
     }
 

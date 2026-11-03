@@ -1,9 +1,11 @@
 //! `brood mcp`: stdio MCP server (newline-delimited JSON-RPC 2.0).
-//! Disabled kanban: zero tools, nothing else happens. Enabled: four tools that call
+//! Disabled kanban: zero tools, nothing else happens. Enabled: five tools that call
 //! the board's HTTP API, plus (research preview) a Claude Code channel that pushes
 //! cards sent to this session.
 
-use super::{CARD_NOTICE, client, frame_card, paths, valid_sid};
+use super::{
+    CARD_NOTICE, COMMENT_NOTICE, client, comments_of, frame_card, frame_comments, paths, valid_sid,
+};
 use crate::{config::Config, procs};
 use serde_json::{Value, json};
 use std::io::{BufRead, Write};
@@ -29,7 +31,7 @@ pub fn tools() -> Value {
     json!([
         {
             "name": "kanban_list",
-            "description": "List kanban cards of this project (id, title, column, rev, priority, tags, owner, body, decision). Optional column filter or single card id.",
+            "description": "List kanban cards of this project (id, title, column, rev, priority, tags, owner, body, decision, comments, awaiting_user). Optional column filter or single card id. Long comment threads are cut to the most recent comments: comments_omitted says how many older ones were left out (ask for one card by id to see more).",
             "inputSchema": {"type": "object", "properties": {
                 "column": {"type": "string"}, "id": {"type": "string"}}}
         },
@@ -51,6 +53,13 @@ pub fn tools() -> Value {
                 "decision": {"type": "string", "description": "The user's review decision on the card."},
                 "priority": {"type": "string"}, "tags": {"type": "array", "items": {"type": "string"}},
                 "column": {"type": "string"}}}
+        },
+        {
+            "name": "kanban_comment",
+            "description": "Add a comment to a card. Set awaiting_user true only when you are truly blocked on a user decision: the card then shows an 'awaiting you' badge until the user replies. Routine progress belongs in the card's column and fields, not in comments.",
+            "inputSchema": {"type": "object", "required": ["id", "text"], "properties": {
+                "id": {"type": "string"}, "text": {"type": "string"},
+                "awaiting_user": {"type": "boolean"}}}
         },
         {
             "name": "kanban_claim",
@@ -84,10 +93,18 @@ pub fn initialize_result(req_version: Option<&str>, channel: bool) -> Value {
 /// The channel notification for one sent card. Meta keys are `[A-Za-z0-9_]` only.
 pub fn channel_notification(card: &Value) -> Value {
     let g = |k: &str| card[k].as_str().unwrap_or_default();
-    let content = format!(
-        "{CARD_NOTICE}\n\n{}\n\nClaim it first (kanban_claim), work it, then move it to review.",
-        frame_card(g("card"), g("title"), g("body"), g("decision"))
-    );
+    let comments = comments_of(&card["comments"]);
+    let content = if card["comment_only"].as_bool() == Some(true) {
+        format!(
+            "{COMMENT_NOTICE}\n\n{}\n\nTake it into account on that card.",
+            frame_comments(g("card"), g("title"), &comments)
+        )
+    } else {
+        format!(
+            "{CARD_NOTICE}\n\n{}\n\nClaim it first (kanban_claim), work it, then move it to review.",
+            frame_card(g("card"), g("title"), g("body"), g("decision"), &comments)
+        )
+    };
     json!({
         "jsonrpc": "2.0",
         "method": "notifications/claude/channel",
@@ -176,6 +193,23 @@ fn ok_or_text((status, v): (u16, Value)) -> Result<Value, String> {
     }
 }
 
+/// Comments kept per card when one card is listed, and when many are.
+const LIST_ONE: usize = 20;
+const LIST_MANY: usize = 3;
+
+/// Keep the last `keep` comments of a card; say how many older ones were left out.
+fn cut_comments(mut card: Value, keep: usize) -> Value {
+    let Some(list) = card["comments"].as_array().cloned() else {
+        return card;
+    };
+    if list.len() > keep {
+        let omitted = list.len() - keep;
+        card["comments"] = json!(list[omitted..]);
+        card["comments_omitted"] = json!(omitted);
+    }
+    card
+}
+
 pub fn call_tool(cfg: &Config, name: &str, args: &Value) -> Result<String, String> {
     if !client::ensure_board(cfg) {
         return Err("kanban board could not be started".into());
@@ -207,6 +241,16 @@ pub fn call_tool(cfg: &Config, name: &str, args: &Value) -> Result<String, Strin
                 .into_iter()
                 .filter(|c| want_col.as_deref().is_none_or(|w| c["column"] == w))
                 .filter(|c| want_id.as_deref().is_none_or(|w| c["id"] == w))
+                .map(|c| {
+                    cut_comments(
+                        c,
+                        if want_id.is_some() {
+                            LIST_ONE
+                        } else {
+                            LIST_MANY
+                        },
+                    )
+                })
                 .collect();
             json!({"columns": all["columns"], "cards": cards})
         }
@@ -245,6 +289,26 @@ pub fn call_tool(cfg: &Config, name: &str, args: &Value) -> Result<String, Strin
             }
             card
         }
+        "kanban_comment" => {
+            let id = card_id(args)?;
+            let text = sarg("text").filter(|t| !t.trim().is_empty());
+            let text = text.ok_or("text required")?;
+            let sid = session_id(&conn);
+            if !valid_sid(&sid) {
+                return Err("bad session id".into());
+            }
+            let awaiting = args["awaiting_user"].as_bool() == Some(true);
+            let card = req(
+                "POST",
+                &format!("{base}/cards/{id}/comment"),
+                Some(&json!({"session": sid, "text": text, "awaiting_user": awaiting})),
+            )?;
+            json!({
+                "id": id,
+                "comments": card["comments"].as_array().map_or(0, Vec::len),
+                "awaiting_user": card["awaiting_user"],
+            })
+        }
         "kanban_claim" => {
             let id = card_id(args)?;
             let sid = session_id(&conn);
@@ -256,11 +320,24 @@ pub fn call_tool(cfg: &Config, name: &str, args: &Value) -> Result<String, Strin
             } else {
                 "claim"
             };
-            req(
+            let mut card = req(
                 "POST",
                 &format!("{base}/cards/{id}/{act}"),
                 Some(&json!({"session": sid})),
-            )?
+            )?;
+            // User comments this session has not seen yet, framed as untrusted data.
+            let pending = comments_of(&card["pending_comments"]);
+            if let Some(o) = card.as_object_mut() {
+                o.remove("pending_comments");
+                if !pending.is_empty() {
+                    let title = o.get("title").and_then(Value::as_str).unwrap_or_default();
+                    o.insert(
+                        "pending_user_comments".into(),
+                        json!(frame_comments(&id, title, &pending)),
+                    );
+                }
+            }
+            card
         }
         other => return Err(format!("unknown tool {other}")),
     };
@@ -353,9 +430,26 @@ mod tests {
     }
 
     #[test]
-    fn enabled_lists_four_tools() {
+    fn enabled_lists_five_tools() {
         let r = handle(true, true, &rpc("tools/list", json!({})), &mut no_call).unwrap();
-        assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 4);
+        let names: Vec<&str> = r["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names.len(), 5);
+        assert!(names.contains(&"kanban_comment"));
+    }
+
+    #[test]
+    fn long_threads_are_cut_and_said_so() {
+        let cs: Vec<Value> = (0..5).map(|i| json!({"text": format!("c{i}")})).collect();
+        let card = cut_comments(json!({"id": "a", "comments": cs}), 3);
+        assert_eq!(card["comments_omitted"], 2);
+        assert_eq!(card["comments"][0]["text"], "c2");
+        let short = cut_comments(json!({"comments": [{"text": "x"}]}), 3);
+        assert!(short.get("comments_omitted").is_none());
     }
 
     #[test]

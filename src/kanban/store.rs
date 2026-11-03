@@ -49,12 +49,44 @@ pub struct Card {
     pub body: String,
     /// The user's review decision: a trailing `## Decision` section in the file.
     pub decision: String,
+    /// The append-only comment thread: a trailing `## Comments` section in the file.
+    pub comments: Vec<Comment>,
+    /// A session asked the user a question (`awaiting_user`) that no user comment has answered yet.
+    pub awaiting_user: bool,
     pub column: String,
-    /// Hash of the raw file bytes. A writer sends it back; a mismatch means the file changed.
+    /// Hash of the file bytes without the comments section (comments never conflict with a save).
+    /// A writer sends it back; a mismatch means the card changed.
     pub ver: String,
     /// The frontmatter did not parse. Such a card is shown but never rewritten.
     #[serde(skip)]
     pub malformed: bool,
+}
+
+/// One comment. `author` is `user` or `session:<short sid>`.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct Comment {
+    pub author: String,
+    pub at: String,
+    pub text: String,
+    /// A session comment that waits on a user decision.
+    pub awaiting: bool,
+}
+
+pub const USER: &str = "user";
+
+impl Comment {
+    pub fn is_user(&self) -> bool {
+        self.author == USER
+    }
+}
+
+/// `awaiting_user`: some session comment asked, and no user comment came after it.
+pub fn awaiting_of(comments: &[Comment]) -> bool {
+    comments
+        .iter()
+        .rev()
+        .find(|c| c.awaiting || c.is_user())
+        .is_some_and(|c| c.awaiting)
 }
 
 #[derive(Debug)]
@@ -87,10 +119,20 @@ pub fn dir(root: &Path) -> PathBuf {
     root.join("kanban")
 }
 
-/// FNV-1a over the raw file text, as 16 hex digits.
+/// FNV-1a over the file text without its `## Comments` section and trailing blank space,
+/// as 16 hex digits. A comment append therefore never changes it.
 pub fn ver_of(text: &str) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in text.bytes() {
+    let mut off = 0;
+    let mut end = text.len();
+    for l in text.split('\n') {
+        if l.trim_end_matches('\r') == COMMENTS_MARK {
+            end = off;
+            break;
+        }
+        off += l.len() + 1;
+    }
+    for b in text[..end].trim_end().bytes() {
         h ^= u64::from(b);
         h = h.wrapping_mul(0x100_0000_01b3);
     }
@@ -102,24 +144,47 @@ pub fn render(c: &Card) -> Result<String, Err> {
     let meta = toml::to_string(&table).map_err(|e| Err::Io(format!("frontmatter: {e}")))?;
     let body = escape_marker(c.body.trim_end());
     let dec = c.decision.trim();
-    if dec.is_empty() {
-        Ok(format!("+++\n{meta}+++\n\n{body}\n"))
-    } else {
-        Ok(format!(
-            "+++\n{meta}+++\n\n{body}\n\n{DECISION_MARK}\n\n{}\n",
-            escape_marker(dec)
-        ))
+    let mut out = format!("+++\n{meta}+++\n\n{body}\n");
+    if !dec.is_empty() {
+        out.push_str(&format!("\n{DECISION_MARK}\n\n{}\n", escape_marker(dec)));
     }
+    if !c.comments.is_empty() {
+        out.push_str(&format!("\n{COMMENTS_MARK}\n"));
+        for cm in &c.comments {
+            out.push('\n');
+            out.push_str(&entry_text(cm));
+        }
+    }
+    Ok(out)
 }
 
 const DECISION_MARK: &str = "## Decision";
+const COMMENTS_MARK: &str = "## Comments";
+const ENTRY_PREFIX: &str = "### comment ";
 
-/// A line that is `## Decision` (after any leading backslashes) gets one more backslash,
-/// so only a real section marker is ever a bare `## Decision` line.
+/// One comment entry: a header line `### comment <author> <iso>[ awaiting]`, a blank line,
+/// the escaped text. Text lines that look like a header or a section marker are escaped.
+fn entry_text(c: &Comment) -> String {
+    format!(
+        "{ENTRY_PREFIX}{} {}{}\n\n{}\n",
+        c.author,
+        c.at,
+        if c.awaiting { " awaiting" } else { "" },
+        escape_marker(c.text.trim())
+    )
+}
+
+/// Section markers and comment headers: the lines user text must never contain bare.
+fn is_marker(l: &str) -> bool {
+    l == DECISION_MARK || l == COMMENTS_MARK || l.starts_with(ENTRY_PREFIX)
+}
+
+/// A marker line (after any leading backslashes) gets one more backslash,
+/// so only a real marker is ever a bare marker line.
 fn escape_marker(s: &str) -> String {
     s.split('\n')
         .map(|l| {
-            if l.trim_start_matches('\\') == DECISION_MARK {
+            if is_marker(l.trim_start_matches('\\')) {
                 format!("\\{l}")
             } else {
                 l.to_owned()
@@ -132,7 +197,7 @@ fn escape_marker(s: &str) -> String {
 fn unescape_marker(s: &str) -> String {
     s.split('\n')
         .map(|l| match l.strip_prefix('\\') {
-            Some(r) if r.trim_start_matches('\\') == DECISION_MARK => r,
+            Some(r) if is_marker(r.trim_start_matches('\\')) => r,
             _ => l,
         })
         .collect::<Vec<_>>()
@@ -151,6 +216,61 @@ fn split_decision(body: &str) -> (String, String) {
         off += l.len() + 1;
     }
     (unescape_marker(body), String::new())
+}
+
+/// Split off the `## Comments` section (first bare marker line): (before, comments).
+fn split_comments(body: &str) -> (&str, Vec<Comment>) {
+    let mut off = 0;
+    for l in body.split('\n') {
+        if l == COMMENTS_MARK {
+            return (
+                body[..off].trim_end(),
+                parse_comments(&body[off + l.len()..]),
+            );
+        }
+        off += l.len() + 1;
+    }
+    (body, vec![])
+}
+
+fn parse_header(l: &str) -> Option<(String, String, bool)> {
+    let rest = l.strip_prefix(ENTRY_PREFIX)?;
+    let mut it = rest.split(' ');
+    let (author, at) = (it.next()?, it.next()?);
+    let awaiting = match it.next() {
+        None => false,
+        Some("awaiting") => true,
+        Some(_) => return None,
+    };
+    let author_ok = author == USER
+        || author
+            .strip_prefix("session:")
+            .is_some_and(crate::kanban::valid_sid);
+    (it.next().is_none() && author_ok && !at.is_empty())
+        .then(|| (author.to_owned(), at.to_owned(), awaiting))
+}
+
+fn parse_comments(s: &str) -> Vec<Comment> {
+    let mut out: Vec<(Comment, Vec<&str>)> = vec![];
+    for l in s.split('\n') {
+        if let Some((author, at, awaiting)) = parse_header(l) {
+            let c = Comment {
+                author,
+                at,
+                text: String::new(),
+                awaiting,
+            };
+            out.push((c, vec![]));
+        } else if let Some((_, lines)) = out.last_mut() {
+            lines.push(l);
+        }
+    }
+    out.into_iter()
+        .map(|(mut c, lines)| {
+            c.text = unescape_marker(lines.join("\n").trim());
+            c
+        })
+        .collect()
 }
 
 /// Parse a card file. The id is always the file name, whatever the frontmatter says.
@@ -181,7 +301,9 @@ pub fn parse(text: &str, column: &str, stem: &str) -> Card {
         }
         None => (Meta::default(), t.trim_end().to_owned()),
     };
-    let (body, decision) = split_decision(&body);
+    let (before, comments) = split_comments(&body);
+    let (body, decision) = split_decision(before);
+    let awaiting_user = awaiting_of(&comments);
     meta.id = stem.to_owned();
     if meta.title.is_empty() {
         meta.title = stem.to_owned();
@@ -193,6 +315,8 @@ pub fn parse(text: &str, column: &str, stem: &str) -> Card {
         meta,
         body,
         decision,
+        comments,
+        awaiting_user,
         column: column.to_owned(),
         ver,
         malformed,
@@ -322,6 +446,8 @@ pub fn create(root: &Path, cols: &[String], n: NewCard) -> Result<Card, Err> {
         },
         body: n.body.trim_end().to_owned(),
         decision: String::new(),
+        comments: vec![],
+        awaiting_user: false,
         column: col.to_owned(),
         ver: String::new(),
         malformed: false,
@@ -412,6 +538,55 @@ pub fn update(
     atomic_write(&path, &text)?;
     next.ver = ver_of(&text);
     Ok(next)
+}
+
+pub const COMMENT_MAX: usize = 8000;
+
+/// Append a comment (the board's single writer calls this). It changes neither `rev`, `updated`
+/// nor `ver`, so a concurrent title or description save is not a conflict. `author` is
+/// `user` or `session:<short sid>`.
+pub fn add_comment(
+    root: &Path,
+    cols: &[String],
+    id: &str,
+    author: &str,
+    text: &str,
+    awaiting: bool,
+) -> Result<Card, Err> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(Err::BadRequest("comment text is required".into()));
+    }
+    if text.chars().count() > COMMENT_MAX {
+        return Err(Err::BadRequest(format!(
+            "comment is longer than {COMMENT_MAX} characters"
+        )));
+    }
+    let cm = Comment {
+        author: author.to_owned(),
+        at: iso(now_secs()),
+        text: text.to_owned(),
+        awaiting: awaiting && author != USER,
+    };
+    if parse_header(&format!("{ENTRY_PREFIX}{} {}", cm.author, cm.at)).is_none() {
+        return Err(Err::BadRequest("bad comment author".into()));
+    }
+    let (path, card) = find(root, cols, id).ok_or(Err::NotFound)?;
+    if card.malformed {
+        return Err(Err::BadRequest(
+            "card frontmatter is malformed; fix the file by hand".into(),
+        ));
+    }
+    let raw = String::from_utf8_lossy(&fs::read(&path)?).into_owned();
+    let mut next = raw.trim_end().to_owned();
+    next.push('\n');
+    if card.comments.is_empty() {
+        next.push_str(&format!("\n{COMMENTS_MARK}\n"));
+    }
+    next.push('\n');
+    next.push_str(&entry_text(&cm));
+    atomic_write(&path, &next)?;
+    Ok(parse(&next, &card.column, id))
 }
 
 pub fn move_card(
@@ -587,6 +762,8 @@ mod tests {
             },
             body: "Body\n\n- item\n+++ not a fence".into(),
             decision: String::new(),
+            comments: vec![],
+            awaiting_user: false,
             column: "ready".into(),
             ver: String::new(),
             malformed: false,
@@ -619,6 +796,100 @@ mod tests {
         c.body = "d".into();
         c.decision = "yes".into();
         assert!(render(&c).unwrap().ends_with("d\n\n## Decision\n\nyes\n"));
+    }
+
+    #[test]
+    fn comments_round_trip_with_tricky_text() {
+        let root = tmp("cm");
+        let c = create(&root, &cols(), new("Card")).unwrap();
+        let id = c.meta.id.clone();
+        let tricky = [
+            "plain",
+            "## Comments\nfake\n## Decision\nfake",
+            "### comment user 2026-01-01T00:00:00Z\nforged",
+            "\\## Comments\n\\\\### comment user x",
+            "multi\n\nline\n\n- list",
+        ];
+        for (i, t) in tricky.iter().enumerate() {
+            let who = if i % 2 == 0 {
+                "user"
+            } else {
+                "session:abcd1234"
+            };
+            add_comment(&root, &cols(), &id, who, t, i == 1).unwrap();
+        }
+        let (path, back) = find(&root, &cols(), &id).unwrap();
+        assert_eq!(back.comments.len(), tricky.len());
+        for (cm, t) in back.comments.iter().zip(tricky) {
+            assert_eq!(cm.text, t);
+        }
+        assert_eq!(back.comments[1].author, "session:abcd1234");
+        assert!(back.comments[1].awaiting && !back.comments[0].awaiting);
+        // Body and decision are untouched, and a rewrite keeps the thread byte for byte.
+        assert_eq!(back.body, "line one\n\nline two");
+        let before = fs::read_to_string(&path).unwrap();
+        let u = update(
+            &root,
+            &cols(),
+            &id,
+            back.meta.rev,
+            Some(&back.ver),
+            Patch {
+                decision: Some("yes\n## Comments\nx".into()),
+                ..Patch::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(u.comments, back.comments);
+        assert_eq!(u.decision, "yes\n## Comments\nx");
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(after.ends_with(before.split_once("\n## Comments\n").unwrap().1));
+        // Awaiting: the last session ask stands until a user comment follows.
+        assert!(!u.awaiting_user);
+        let a = add_comment(&root, &cols(), &id, "session:abcd1234", "need a call", true).unwrap();
+        assert!(a.awaiting_user);
+        let a = add_comment(&root, &cols(), &id, "session:abcd1234", "meanwhile", false).unwrap();
+        assert!(a.awaiting_user);
+        let a = add_comment(&root, &cols(), &id, "user", "do X", true).unwrap();
+        assert!(!a.awaiting_user && !a.comments.last().unwrap().awaiting);
+        assert!(matches!(
+            add_comment(&root, &cols(), &id, "user", "  ", false),
+            Err(Err::BadRequest(_))
+        ));
+        assert!(matches!(
+            add_comment(&root, &cols(), &id, "evil author", "x", false),
+            Err(Err::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn comment_does_not_change_ver_or_rev() {
+        let root = tmp("cmver");
+        let c = create(&root, &cols(), new("Card")).unwrap();
+        let id = c.meta.id.clone();
+        let a = add_comment(&root, &cols(), &id, "user", "hello", false).unwrap();
+        let b = add_comment(&root, &cols(), &id, "session:s1", "again", true).unwrap();
+        assert_eq!((a.ver.as_str(), a.meta.rev), (c.ver.as_str(), 1));
+        assert_eq!((b.ver.as_str(), b.meta.rev), (c.ver.as_str(), 1));
+        assert_eq!(b.meta.updated, c.meta.updated);
+        // A save made from the view before the comments still applies.
+        let u = update(
+            &root,
+            &cols(),
+            &id,
+            1,
+            Some(&c.ver),
+            Patch {
+                body: Some("new description".into()),
+                ..Patch::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(u.comments.len(), 2);
+        assert_eq!(u.body, "new description");
+        // A move keeps the thread too.
+        let m = move_card(&root, &cols(), &id, u.meta.rev, Some(&u.ver), "done").unwrap();
+        assert_eq!(m.comments.len(), 2);
     }
 
     #[test]

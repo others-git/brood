@@ -821,12 +821,22 @@ fn user_prompt(cfg: &config::Config, ev: &Value, session: &str) -> Option<Value>
         parts.push(TURN_REMINDER.to_owned());
     }
     if cfg.kanban && !session.is_empty() {
-        let cards = kanban::client::take_sent(cfg, session, 100);
+        let (notes, cards): (Vec<Value>, Vec<Value>) = kanban::client::take_sent(cfg, session, 100)
+            .into_iter()
+            .partition(|c| c["comment_only"].as_bool() == Some(true));
         if !cards.is_empty() {
             let list: Vec<String> = cards.iter().map(sent_card_text).collect();
             parts.push(format!(
                 "{}\n\n{}\n\nClaim each card (kanban_claim), work it, then move it to review.",
                 kanban::CARD_NOTICE,
+                list.join("\n\n")
+            ));
+        }
+        if !notes.is_empty() {
+            let list: Vec<String> = notes.iter().map(sent_card_text).collect();
+            parts.push(format!(
+                "{}\n\n{}\n\nTake it into account on those cards.",
+                kanban::COMMENT_NOTICE,
                 list.join("\n\n")
             ));
         }
@@ -863,21 +873,31 @@ fn main_stop(cfg: &config::Config, session: &str) -> Option<Value> {
         && !session.is_empty()
         && let Some(card) = kanban::client::take_sent(cfg, session, 1).first()
     {
-        return Some(json!({
-            "decision": "block",
-            "reason": format!(
+        let reason = if card["comment_only"].as_bool() == Some(true) {
+            format!(
+                "{}\n\n{}\n\nTake it into account on that card.",
+                kanban::COMMENT_NOTICE,
+                sent_card_text(card)
+            )
+        } else {
+            format!(
                 "{}\n\n{}\n\nClaim it (kanban_claim), work it, then move it to review.",
                 kanban::CARD_NOTICE,
                 sent_card_text(card)
-            ),
-        }));
+            )
+        };
+        return Some(json!({"decision": "block", "reason": reason}));
     }
     None
 }
 
 fn sent_card_text(c: &Value) -> String {
     let g = |k: &str| c[k].as_str().unwrap_or_default();
-    kanban::frame_card(g("card"), g("title"), g("body"), g("decision"))
+    let comments = kanban::comments_of(&c["comments"]);
+    if c["comment_only"].as_bool() == Some(true) {
+        return kanban::frame_comments(g("card"), g("title"), &comments);
+    }
+    kanban::frame_card(g("card"), g("title"), g("body"), g("decision"), &comments)
 }
 
 fn session_end(cfg: &config::Config, session: &str) -> Option<Value> {

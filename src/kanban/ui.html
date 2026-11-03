@@ -32,6 +32,13 @@ button{cursor:pointer}button.pri{background:var(--acc);color:#fff;border-color:v
 #pop button{text-align:left;border:0;background:transparent}
 #pop button:hover,#pop button:focus-visible{background:var(--col);outline:2px solid var(--acc)}
 .go:focus-visible{outline:2px solid var(--acc)}
+.badge.await{border-color:var(--warn);color:var(--warn);font-weight:600}
+.badge.off{border-color:var(--mut);color:var(--mut)}
+#thread{max-height:220px;overflow-y:auto;display:flex;flex-direction:column;gap:6px;margin:4px 0 6px}
+.cm{border:1px solid var(--bd);border-radius:5px;padding:5px 8px;background:var(--card)}
+.cm.sess{border-left:3px solid var(--acc)}
+.cm .h{color:var(--mut);font-size:12px}.cm .x{white-space:pre-wrap;overflow-wrap:anywhere}
+#c-box{height:70px;font-family:inherit}
 .tag{border:1px solid var(--bd);border-radius:9px;padding:0 6px;margin-right:3px}
 dialog{background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:8px;width:min(640px,94vw)}
 dialog::backdrop{background:#0006}
@@ -58,6 +65,12 @@ dialog input,dialog textarea{width:100%;margin:4px 0 10px}dialog textarea{height
       <label>Tags <input id="f-tags" style="width:200px;margin:0" placeholder="comma separated"></label>
     </div>
     <p class="m" id="f-info" style="color:var(--mut);font-size:12px"></p>
+    <div id="cm-sec">
+      <div class="m" style="color:var(--mut);font-size:12px">Comments <span id="c-state"></span></div>
+      <div id="thread"></div>
+      <textarea id="c-box" placeholder="Comment (Ctrl+Enter to post)" style="margin-bottom:4px"></textarea>
+      <div class="row" style="margin-bottom:10px"><button type="button" id="c-post">Comment</button><span id="c-hint" style="color:var(--mut);font-size:12px"></span></div>
+    </div>
     <div class="row">
       <button type="button" id="save" class="pri">Save</button>
       <button type="button" id="cancel">Close</button>
@@ -119,7 +132,7 @@ function render() {
     const box = el.querySelector(".cards");
     for (const c of list) {
       const d = document.createElement("div"); d.className = "card"; d.draggable = true;
-      d.innerHTML = `<div class="t">${esc(c.title)}</div><div class="m">${c.column === "review" && c.decision ? `<span class="badge" title="has a review decision">decision</span>` : ""}${c.tags.map(t => `<span class="tag">${esc(t)}</span>`).join("")}${c.priority !== "normal" ? esc(c.priority) + " " : ""}${c.owner ? `<span class="badge claimed" title="claimed by session ${esc(c.owner)}">claimed ${esc(c.owner.slice(0, 8))}</span>` : sentTo.has(c.id) ? `<span class="badge">sent ${esc(sentTo.get(c.id))}</span>` : ""}</div>${NO_SEND.includes(c.column) ? "" : `<button type="button" class="go" draggable="false" aria-label="Send to session" title="Send to session">&#10148;</button>`}`;
+      d.innerHTML = `<div class="t">${esc(c.title)}</div><div class="m">${c.column === "review" && c.decision ? `<span class="badge" title="has a review decision">decision</span>` : ""}${c.tags.map(t => `<span class="tag">${esc(t)}</span>`).join("")}${c.priority !== "normal" ? esc(c.priority) + " " : ""}${c.awaiting_user ? `<span class="badge await" title="a session is waiting for your answer">awaiting you</span>` : ""}${c.owner && c.owner_state === "offline" ? `<span class="badge off" title="the claiming session is gone">owner offline</span>` : ""}${c.comments && c.comments.length ? `<span class="tag" title="comments">${c.comments.length} &#9993;</span>` : ""}${c.owner ? `<span class="badge claimed" title="claimed by session ${esc(c.owner)}">claimed ${esc(c.owner.slice(0, 8))}</span>` : sentTo.has(c.id) ? `<span class="badge">sent ${esc(sentTo.get(c.id))}</span>` : ""}</div>${NO_SEND.includes(c.column) ? "" : `<button type="button" class="go" draggable="false" aria-label="Send to session" title="Send to session">&#10148;</button>`}`;
       const go = d.querySelector(".go");
       if (go) {
       const pj = projects.find(x => x.id === project);
@@ -189,13 +202,36 @@ async function openCard(c) {
   $("send").style.display = $("f-sess").style.display = NO_SEND.includes(c.column) ? "none" : "";
   const list = await liveSessions();
   $("f-sess").innerHTML = list.length ? list.map(x => `<option value="${esc(x.session)}">${esc(x.session.slice(0, 8))} ${esc(x.cwd.split(/[\\/]/).pop())}</option>`).join("") : `<option value="">no live sessions</option>`;
+  showThread(c);
+  $("c-box").value = "";
   $("dlg").showModal();
 }
+function showThread(c) {
+  $("cm-sec").style.display = "";
+  $("thread").innerHTML = (c.comments || []).map(m => `<div class="cm${m.author === "user" ? "" : " sess"}"><div class="h">${esc(m.author === "user" ? "you" : m.author)} &middot; ${esc(m.at)}${m.awaiting ? " &middot; awaiting you" : ""}</div><div class="x">${esc(m.text)}</div></div>`).join("") || `<div class="h" style="color:var(--mut)">No comments yet.</div>`;
+  $("thread").scrollTop = $("thread").scrollHeight;
+  const st = c.owner_state || (c.owner ? "live" : "unclaimed");
+  $("c-state").textContent = c.awaiting_user ? "(awaiting you)" : "";
+  $("c-hint").textContent = st === "live" ? "Delivered to the claiming session." : st === "offline"
+    ? "Owner offline: delivered when the card is next sent or claimed." : "Unclaimed: delivered when the card is next sent or claimed.";
+}
+$("c-post").onclick = async () => {
+  const text = $("c-box").value;
+  if (!editing || !text.trim()) return;
+  const r = await api("POST", `/api/projects/${project}/cards/${editing.id}/comment`, {text});
+  if (r.status >= 400) { note(r.data && r.data.error || "comment failed"); return; }
+  // A comment changes neither rev nor ver: keep the form's view and take only the thread.
+  editing = {...editing, comments: r.data.comments, awaiting_user: r.data.awaiting_user, owner_state: r.data.owner_state};
+  $("c-box").value = ""; showThread(editing);
+  note(r.data.delivered ? "comment delivered to the session" : "comment saved");
+};
+$("c-box").onkeydown = e => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); $("c-post").onclick(); } };
 $("new").onclick = () => {
   editing = null;
   $("f-title").value = ""; $("f-body").value = ""; $("f-dec").value = ""; $("l-dec").style.display = "none"; $("f-prio").value = "normal"; $("f-tags").value = "";
   $("f-info").textContent = "New card in " + columns[0];
   $("send").style.display = $("f-sess").style.display = "none";
+  $("cm-sec").style.display = "none";
   $("dlg").showModal();
 };
 $("cancel").onclick = () => $("dlg").close();
