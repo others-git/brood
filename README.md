@@ -37,8 +37,11 @@ These rules apply to the coordinator only, per user message, when `coordinator` 
 
 | Rule | Override |
 |---|---|
-| Foreground build or replay (`cargo build`, `make`, `npm run build`, game runs). Tests and checks (`cargo test`, `pytest`, `go test`, `npm test`, `cargo check`, `clippy`) run inline | `run_in_background`, or `#solo` |
+| Foreground build or replay (`cargo build`, `make`, `npm run build`, game runs). Tests and checks (`cargo test`, `pytest`, `go test`, `npm test`, `cargo check`, `clippy`) run inline | `run_in_background`, `#solo`, or the quick-build allowance below |
+| Foreground build that qualifies for the quick-build allowance but whose Bash call has no `timeout`, or one over `quick_build_timeout_secs` | Retry with `timeout` (ms) at or under the cap |
 | `general-purpose` agent without `model` | Set `model`, or use a brood agent |
+
+**Quick-build allowance.** A foreground Bash build is allowed in the coordinator when it is a plain compile (`cargo build`, `dotnet build`, `npm run build`, `go build`, `tsc`, `make`, `cmake`, `ninja`, `gradle`, `mvn`, `msbuild`, `xcodebuild`) and this message's edits are small: at least one edit, at most `trivial_edit_lines` changed lines in total, at most 2 files. It is also allowed with no edit if every simple command is `git`, `cd` or matches a `quick_builds` regex (matched like `free_commands`, against each whole simple command, e.g. `^dotnet build\\b`). Either way the call needs a `timeout` of at most `quick_build_timeout_secs` seconds. Replays, game runs, `run`, `install`, `publish` and project scripts stay refused. Subagents are unaffected. The refusal message names the allowance and `quick_builds`.
 
 Git-only commands and `free_commands` matches do not count toward the nudges. The counts reset when the coordinator turn ends.
 
@@ -133,6 +136,8 @@ The file is optional. Every key is optional.
 | `trivial_edit_lines` | `30` | Edit size (lines) that triggers the soft nudge. `0` = off. |
 | `firm_nudge_after` | `8` | Work tool calls per message that trigger the firm nudge. `0` = off. |
 | `free_commands` | `[]` | Regexes for shell commands that do not count toward the nudges. |
+| `quick_builds` | `[]` | Regexes for build commands the coordinator may run inline with no edit this message. Every simple command must be `git`, `cd` or match. Still needs a `timeout`. |
+| `quick_build_timeout_secs` | `120` | Longest `timeout` a quick build may request. |
 | `scan_tools` | `^(WebFetch\|WebSearch\|mcp__.*)$` | Regex on tool names whose output brood scans. |
 | `extra_secret_patterns` | `[]` | Extra regexes for secrets. |
 | `extra_injection_patterns` | `[]` | Extra regexes for instruction-like text. |
@@ -180,7 +185,7 @@ The data directory is `~/.local/share/brood` (Linux), `~/Library/Application Sup
 | Problem | Action |
 |---|---|
 | Hooks do nothing | Make sure `brood --version` works in the shell Claude Code uses. |
-| Coordinator refuses a small task | Only a foreground build or replay is refused: run it in the background. Add `#solo` to the message to allow it. Nudges are advice: raise `main_tool_budget` or `firm_nudge_after`, or set them to `0`. |
+| Coordinator refuses a small task | Only a foreground build or replay is refused: run it in the background, or edit a little (1-2 files) and build with a `timeout`. Add `#solo` to the message to allow it. Nudges are advice: raise `main_tool_budget` or `firm_nudge_after`, or set them to `0`. |
 | Config has no effect | Check the TOML syntax. brood uses all defaults if the file does not parse. |
 | Processes remain | Run `brood ps`, then `brood gc`. |
 

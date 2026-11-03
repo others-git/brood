@@ -55,6 +55,8 @@ pub struct AgentState {
     pub solo: bool,
     /// Main session only: files edited since the user's last message.
     pub turn_files: Vec<String>,
+    /// Main session only: lines changed by edits since the user's last message.
+    pub turn_edit_lines: u32,
     /// Main session only: soft / firm nudge already queued this user message.
     pub nudged_soft: bool,
     pub nudged_firm: bool,

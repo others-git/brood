@@ -23,6 +23,11 @@ pub struct Config {
     /// Regexes for shell commands that don't count toward the work budget
     /// (matched against each simple command). Commands made only of `git` are always free.
     pub free_commands: Vec<String>,
+    /// Regexes for build commands the coordinator may run inline even with no edit this turn
+    /// (matched like `free_commands`: every simple command must be `git`, `cd` or match). Still needs a `timeout`.
+    pub quick_builds: Vec<String>,
+    /// Longest `timeout` (seconds) a coordinator foreground build may ask for.
+    pub quick_build_timeout_secs: u32,
     /// Tools whose output is scanned for prompt injection (regex on tool name).
     pub scan_tools: String,
     /// Extra regexes for secrets that must never leave the machine.
@@ -53,6 +58,8 @@ impl Default for Config {
             trivial_edit_lines: 30,
             firm_nudge_after: 8,
             free_commands: vec![],
+            quick_builds: vec![],
+            quick_build_timeout_secs: 120,
             scan_tools: r"^(WebFetch|WebSearch|mcp__.*)$".into(),
             extra_secret_patterns: vec![],
             extra_injection_patterns: vec![],

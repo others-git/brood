@@ -305,52 +305,113 @@ pub fn merge_failed(text: &str) -> bool {
     MERGE_FAILED.is_match(text)
 }
 
+/// How long-running a build-class command is.
+#[derive(PartialEq, Clone, Copy)]
+enum BuildKind {
+    /// A plain compile or build step.
+    Compile,
+    /// Replays, game runs, installs, servers, benches, project scripts.
+    Long,
+}
+
+/// Classify one simple command (`words`), or `None` if it isn't build-class.
+fn build_kind(words: &[String]) -> Option<BuildKind> {
+    use BuildKind::{Compile, Long};
+    let exe = words[0]
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let exe = exe.strip_suffix(".exe").unwrap_or(&exe);
+    let sub = words
+        .get(1)
+        .map(|w| w.to_ascii_lowercase())
+        .unwrap_or_default();
+    let sub = sub.as_str();
+    let noemit = words.iter().any(|w| w == "--noEmit");
+    let yes = |b: bool, k| b.then_some(k);
+    match exe {
+        // Tests and checks (cargo test/check/clippy/nextest, dotnet test,
+        // go test, npm test, pytest, jest, vitest, ...) are quick enough
+        // to run inline, so only builds and runs are matched here.
+        "cargo" => match sub {
+            "build" | "b" => Some(Compile),
+            "run" | "r" | "bench" => Some(Long),
+            _ => None,
+        },
+        "dotnet" => match sub {
+            "build" => Some(Compile),
+            "run" | "publish" => Some(Long),
+            _ => None,
+        },
+        "npm" | "pnpm" | "yarn" | "bun" => match sub {
+            "run" | "run-script" => {
+                let script = words.get(2).map(|w| w.to_ascii_lowercase());
+                let script = script.as_deref().unwrap_or_default();
+                if ["test", "lint", "check", "typecheck"]
+                    .iter()
+                    .any(|p| script.starts_with(p))
+                {
+                    None
+                } else if script.starts_with("build") {
+                    Some(Compile)
+                } else {
+                    Some(Long)
+                }
+            }
+            "build" => Some(Compile),
+            "install" | "i" | "ci" | "start" => Some(Long),
+            _ => None,
+        },
+        "npx" => {
+            if sub == "playwright" {
+                Some(Long)
+            } else {
+                yes(sub == "tsc" && !noemit, Compile)
+            }
+        }
+        "go" => match sub {
+            "build" => Some(Compile),
+            "run" => Some(Long),
+            _ => None,
+        },
+        "tsc" => yes(!noemit, Compile),
+        "msbuild" | "make" | "cmake" | "ninja" | "gradle" | "gradlew" | "mvn" | "xcodebuild" => {
+            Some(Compile)
+        }
+        e if e.starts_with("godot") || e.starts_with("unity") => Some(Long),
+        // Project scripts like tools/run_replays.sh, build.sh, run_tests.ps1.
+        e if e.contains('.') && (e.contains("replay") || e.contains("build")) => Some(Long),
+        _ => None,
+    }
+}
+
 /// Builds, replays, game runs and other commands that take a while (not
 /// tests or checks, which run inline). Judged by
 /// the program being run and its subcommand, never by words in arguments,
 /// heredocs or commit messages.
 pub fn is_build(cmd: &str) -> bool {
-    simple_commands(cmd).iter().any(|words| {
-        let exe = words[0]
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let exe = exe.strip_suffix(".exe").unwrap_or(&exe);
-        let sub = words
-            .get(1)
-            .map(|w| w.to_ascii_lowercase())
-            .unwrap_or_default();
-        let sub = sub.as_str();
-        let noemit = words.iter().any(|w| w == "--noEmit");
-        match exe {
-            // Tests and checks (cargo test/check/clippy/nextest, dotnet test,
-            // go test, npm test, pytest, jest, vitest, ...) are quick enough
-            // to run inline, so only builds and runs are matched here.
-            "cargo" => matches!(sub, "build" | "b" | "run" | "r" | "bench"),
-            "dotnet" => matches!(sub, "build" | "run" | "publish"),
-            "npm" | "pnpm" | "yarn" | "bun" => match sub {
-                "run" | "run-script" => {
-                    let script = words.get(2).map(|w| w.to_ascii_lowercase());
-                    let script = script.as_deref().unwrap_or_default();
-                    !["test", "lint", "check", "typecheck"]
-                        .iter()
-                        .any(|p| script.starts_with(p))
-                }
-                "build" | "install" | "i" | "ci" | "start" => true,
-                _ => false,
-            },
-            "npx" => matches!(sub, "playwright") || (sub == "tsc" && !noemit),
-            "go" => matches!(sub, "build" | "run"),
-            "tsc" => !noemit,
-            "msbuild" | "make" | "cmake" | "ninja" | "gradle" | "gradlew" | "mvn"
-            | "xcodebuild" => true,
-            e if e.starts_with("godot") || e.starts_with("unity") => true,
-            // Project scripts like tools/run_replays.sh, build.sh, run_tests.ps1.
-            e if e.contains('.') && (e.contains("replay") || e.contains("build")) => true,
-            _ => false,
-        }
-    })
+    simple_commands(cmd).iter().any(|w| build_kind(w).is_some())
+}
+
+/// Whether `cmd` is a build and every build-class part is a plain compile
+/// (no replays, runs, installs, servers or project scripts).
+pub fn is_compile_only(cmd: &str) -> bool {
+    let kinds: Vec<_> = simple_commands(cmd)
+        .iter()
+        .filter_map(|w| build_kind(w))
+        .collect();
+    !kinds.is_empty() && kinds.iter().all(|k| *k == BuildKind::Compile)
+}
+
+/// Whether every simple command in `cmd` is `git`, `cd` or matches one of `pats`
+/// (each tried against the whole simple command, like `free_commands`).
+pub fn matches_all(cmd: &str, pats: &[Regex]) -> bool {
+    let cmds = simple_commands(cmd);
+    !cmds.is_empty()
+        && cmds.iter().all(|w| {
+            git_args(w).is_some() || w[0] == "cd" || pats.iter().any(|r| r.is_match(&w.join(" ")))
+        })
 }
 
 const SECRET_PATTERNS: &[&str] = &[
@@ -527,6 +588,32 @@ mod tests {
         ] {
             assert!(!is_build(c), "{c}");
         }
+    }
+
+    #[test]
+    fn compile_vs_long() {
+        for c in [
+            "cargo build",
+            "cd g && dotnet build -c Debug",
+            "npm run build",
+            "make -j8",
+        ] {
+            assert!(is_compile_only(c), "{c}");
+        }
+        for c in [
+            "cargo run",
+            "dotnet run",
+            "tools/run_replays.sh",
+            "godot --headless",
+            "npm install",
+            "dotnet build && tools/run_replays.sh",
+            "cargo test",
+        ] {
+            assert!(!is_compile_only(c), "{c}");
+        }
+        let pats = [Regex::new(r"^dotnet build\b").unwrap()];
+        assert!(matches_all("cd g && dotnet build x.csproj", &pats));
+        assert!(!matches_all("dotnet build && rm -rf x", &pats));
     }
 
     #[test]

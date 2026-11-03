@@ -699,16 +699,16 @@ fn coordinator_check(cfg: &config::Config, ev: &Value, session: &str) -> Option<
     if tool == "Bash"
         && input["run_in_background"].as_bool() != Some(true)
         && guard::is_build(input["command"].as_str().unwrap_or_default())
+        && let Some(r) = quick_build_denial(cfg, input, &st)
     {
-        return Some(format!(
-            "brood:coordinator: builds and replays block the main session. {DELEGATE_HINT}"
-        ));
+        return Some(r);
     }
     let mut big_edit = None;
     if let Some(lines) = edit_lines(tool, input) {
         if cfg.trivial_edit_lines > 0 && lines > cfg.trivial_edit_lines as usize {
             big_edit = Some(lines);
         }
+        st.turn_edit_lines = st.turn_edit_lines.saturating_add(lines as u32);
         if !st.turn_files.iter().any(|f| f == path) {
             st.turn_files.push(path.to_owned());
         }
@@ -747,6 +747,42 @@ fn coordinator_check(cfg: &config::Config, ev: &Value, session: &str) -> Option<
     None
 }
 
+/// `None` if the coordinator may run this foreground build inline, else the denial.
+/// Allowed when it is a plain compile after a small edit this turn (>= 1 edit,
+/// <= `trivial_edit_lines` changed lines, <= 2 files), or when it matches
+/// `quick_builds`; and the Bash call carries a `timeout` <= `quick_build_timeout_secs`.
+fn quick_build_denial(
+    cfg: &config::Config,
+    input: &Value,
+    st: &state::AgentState,
+) -> Option<String> {
+    let cmd = input["command"].as_str().unwrap_or_default();
+    let quick: Vec<regex::Regex> = cfg
+        .quick_builds
+        .iter()
+        .filter_map(|p| regex::Regex::new(p).ok())
+        .collect();
+    let small_edit = cfg.trivial_edit_lines > 0
+        && !st.turn_files.is_empty()
+        && st.turn_files.len() <= 2
+        && st.turn_edit_lines <= cfg.trivial_edit_lines
+        && guard::is_compile_only(cmd);
+    if !(small_edit || guard::matches_all(cmd, &quick)) {
+        return Some(format!(
+            "brood:coordinator: builds and replays block the main session. A plain build is allowed inline after a small edit this turn (1-2 files, at most {} changed lines), or when it matches `quick_builds` in the brood config; replays and long runs never are. {DELEGATE_HINT}",
+            cfg.trivial_edit_lines
+        ));
+    }
+    let max_ms = u64::from(cfg.quick_build_timeout_secs) * 1000;
+    match input["timeout"].as_u64() {
+        Some(t) if t > 0 && t <= max_ms => None,
+        _ => Some(format!(
+            "brood:coordinator: this quick build is allowed inline, but retry the Bash call with `timeout` of at most {max_ms} ms (quick_build_timeout_secs = {}) so it can't block the session.",
+            cfg.quick_build_timeout_secs
+        )),
+    }
+}
+
 /// Lines an edit tool call changes: the larger side of a replacement, or the
 /// whole content for a new file. `None` for tools that don't edit.
 fn edit_lines(tool: &str, input: &Value) -> Option<usize> {
@@ -767,12 +803,13 @@ fn edit_lines(tool: &str, input: &Value) -> Option<usize> {
     }
 }
 
-const TURN_REMINDER: &str = "You are brood:coordinator. Quick fixes (a handful of tool calls, one or two files) you do yourself, tests and checks inline. If the request clearly needs more (new feature, multi-file work, refactor, any build), delegate at once without reading or searching first; the subagent explores, so brief it with the request and known paths. Explore inline only if unsure it is quick. Foreground builds are refused.";
+const TURN_REMINDER: &str = "You are brood:coordinator. Quick fixes go inline when you already know the exact edit (one or two files, a few lines), even if they need a build: make the edit, run one build with a Bash `timeout` of at most 120000 ms, then commit. Tests and checks run inline. Bigger work (new feature, multi-file work, refactor) you delegate at once without reading or searching first; the subagent explores, so brief it with the request and known paths. Replays and long runs are never run in the main session.";
 
 fn user_prompt(cfg: &config::Config, ev: &Value, session: &str) -> Option<Value> {
     let mut st = state::load_agent(session, COORDINATOR);
     st.turn_calls = 0;
     st.turn_files.clear();
+    st.turn_edit_lines = 0;
     st.nudged_soft = false;
     st.nudged_firm = false;
     st.pending_nudge = None;
@@ -815,6 +852,7 @@ fn main_stop(cfg: &config::Config, session: &str) -> Option<Value> {
     let mut st = state::load_agent(session, COORDINATOR);
     st.turn_calls = 0;
     st.turn_files.clear();
+    st.turn_edit_lines = 0;
     st.nudged_soft = false;
     st.nudged_firm = false;
     st.pending_nudge = None;
@@ -1128,6 +1166,73 @@ mod tests {
             );
         }
         assert!(coordinator_check(&cfg, &ev("cargo build"), &session).is_some());
+    }
+
+    #[test]
+    fn quick_build_allowance() {
+        let session = format!("brood-test-quick-{}", std::process::id());
+        let edit = |f: &str, n: usize| json!({"tool_name": "Edit", "tool_input": {"file_path": f, "old_string": "a", "new_string": "x\n".repeat(n)}});
+        let build = |c: &str, t: Option<u64>| {
+            let mut v = json!({"tool_name": "Bash", "tool_input": {"command": c}});
+            if let Some(t) = t {
+                v["tool_input"]["timeout"] = json!(t);
+            }
+            v
+        };
+        let cfg = config::Config::default();
+        let go = |cfg: &config::Config| user_prompt(cfg, &json!({"prompt": "go"}), &session);
+        go(&cfg);
+        // No edit: denied, message names the allowance.
+        let r = coordinator_check(&cfg, &build("dotnet build", Some(60000)), &session).unwrap();
+        assert!(r.contains("quick_builds") && r.contains("small edit"));
+        // Small edit: allowed with a timeout, denied without or over the cap.
+        assert!(coordinator_check(&cfg, &edit("/p/a.cs", 3), &session).is_none());
+        assert!(coordinator_check(&cfg, &build("dotnet build", Some(120000)), &session).is_none());
+        assert!(
+            coordinator_check(&cfg, &build("dotnet build", None), &session)
+                .unwrap()
+                .contains("timeout")
+        );
+        assert!(
+            coordinator_check(&cfg, &build("dotnet build", Some(120001)), &session)
+                .unwrap()
+                .contains("timeout")
+        );
+        // Replays and runs stay denied.
+        for c in [
+            "tools/run_replays.sh",
+            "dotnet run",
+            "dotnet build && tools/run_replays.sh",
+        ] {
+            let r = coordinator_check(&cfg, &build(c, Some(60000)), &session).unwrap();
+            assert!(r.contains("quick_builds"), "{c}");
+        }
+        // Third file: denied.
+        assert!(coordinator_check(&cfg, &edit("/p/b.cs", 1), &session).is_none());
+        assert!(coordinator_check(&cfg, &build("dotnet build", Some(60000)), &session).is_none());
+        assert!(coordinator_check(&cfg, &edit("/p/c.cs", 1), &session).is_none());
+        assert!(coordinator_check(&cfg, &build("dotnet build", Some(60000)), &session).is_some());
+        // Large edit: denied.
+        go(&cfg);
+        assert!(coordinator_check(&cfg, &edit("/p/a.cs", 31), &session).is_none());
+        assert!(coordinator_check(&cfg, &build("dotnet build", Some(60000)), &session).is_some());
+        // quick_builds match: allowed with no edit, still needs a timeout.
+        let qb = config::Config {
+            quick_builds: vec![r"^dotnet build\b".into()],
+            ..Default::default()
+        };
+        go(&qb);
+        assert!(
+            coordinator_check(
+                &qb,
+                &build("cd g && dotnet build x.csproj", Some(1000)),
+                &session
+            )
+            .is_none()
+        );
+        assert!(coordinator_check(&qb, &build("dotnet build", None), &session).is_some());
+        assert!(coordinator_check(&qb, &build("cargo build", Some(1000)), &session).is_some());
+        let _ = std::fs::remove_dir_all(state::session_dir(&session));
     }
 
     #[test]
